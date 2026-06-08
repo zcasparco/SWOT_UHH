@@ -1,2 +1,3 @@
-# SWOT submesoscale analysis and assimilation
-Tools for SWOT data visualization and analysis, notably through SSH wavenumber spectra analysis.
+# STUDYING OCEAN KINETIC ENERGY THROUGH A COMBINATION OF NOVEL SWOT ALTIMETER DATA AND REGIONAL IN SITU OBSERVATIONS
+
+A brief description of what this project does and who it's for
