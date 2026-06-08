@@ -1,3 +1,6 @@
-# STUDYING OCEAN KINETIC ENERGY THROUGH A COMBINATION OF NOVEL SWOT ALTIMETER DATA AND REGIONAL IN SITU OBSERVATIONS
+# Studying ocean kinetic energy through SWOT altimeter data
 
-A brief description of what this project does and who it's for
+
+## Authors
+
+- [Zoé Caspar-Cohen](https://www.github.com/zcasparco)
