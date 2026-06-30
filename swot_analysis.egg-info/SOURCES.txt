@@ -1,7 +1,9 @@
 README.md
 setup.py
-swot_analysis/another_test.py
+swot_analysis/__init__.py
 swot_analysis/plotting.py
+swot_analysis/swot_alongtrack_slope.py
+swot_analysis/swot_alongtrack_spectra.py
 swot_analysis.egg-info/PKG-INFO
 swot_analysis.egg-info/SOURCES.txt
 swot_analysis.egg-info/dependency_links.txt
