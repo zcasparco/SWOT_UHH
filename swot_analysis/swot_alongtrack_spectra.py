@@ -451,13 +451,11 @@ def compute_pass_spectra(
     min_pixels_per_segment: int = 3,
 ):
     """
-    Top-level convenience function: compute along-track wavenumber
+    Compute along-track wavenumber
     spectra for BOTH swaths (left and right) of a SWOT L2 LR Basic pass,
     handling land/NaN gaps and the nadir gap automatically.
 
-    Parameters mirror compute_swath_spectra(); see that function's
-    docstring for full details.
-
+    Parameters mirror compute_swath_spectra().
     Returns
     -------
     dict with keys "left" and "right", each a PassSpectrumResult.
