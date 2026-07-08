@@ -311,7 +311,7 @@ def compute_swath_spectra(
     -------
     PassSpectrumResult
     """
-    ssha = np.asarray(ssha, dtype=float)
+    ssha = np.asarray(ssha, dtype=np.float64)
     cols = np.where(swath_mask)[0]
     if cols.size == 0:
         raise ValueError(f"No pixels found for swath '{swath_name}'.")
@@ -325,7 +325,7 @@ def compute_swath_spectra(
     if along_track_spacing_km is None:
         diffs = np.diff(distance_km)
         diffs = diffs[diffs > 0]
-        along_track_spacing_km = float(np.median(diffs)) if diffs.size else 2.0
+        along_track_spacing_km = np.float64(np.median(diffs)) if diffs.size else 2.0
 
     bounds = _segment_bounds(distance_km, segment_length_km, overlap=overlap)
 
@@ -363,7 +363,7 @@ def compute_swath_spectra(
         for c in range(seg_ssha.shape[1]):
             col = seg_ssha[:, c]
             valid = ~np.isnan(col)
-            valid_frac = valid.mean() if len(col) else 0.0
+            valid_frac = float(valid.mean()) if len(col) else 0.0
             valid_fracs.append(valid_frac)
 
             if valid_frac < (1.0 - max_gap_fraction) or valid.sum() < 8:
@@ -410,12 +410,12 @@ def compute_swath_spectra(
             wavenumber=freqs,
             psd=mean_pxx,
             n_pixels_used=n_pixels_used,
-            lat_mean=float(np.nanmean(seg_lat)),
-            lat_min=float(np.nanmin(seg_lat)),
-            lat_max=float(np.nanmax(seg_lat)),
-            lon_mean=float(np.nanmean(seg_lon)),
-            along_track_distance_start_km=float(seg_dist[0]),
-            along_track_distance_end_km=float(seg_dist[-1]),
+            lat_mean=float(np.nanmean(seg_lat).item()),
+            lat_min=float(np.nanmin(seg_lat).item()),
+            lat_max=float(np.nanmax(seg_lat).item()),
+            lon_mean=float(np.nanmean(seg_lon).item()),
+            along_track_distance_start_km=float(seg_dist[0].item()),
+            along_track_distance_end_km=float(seg_dist[-1].item()),
             valid_fraction=float(np.mean(valid_fracs)) if valid_fracs else 0.0,
             gap_filled=any_gap_filled,
         ))
@@ -479,5 +479,3 @@ def compute_pass_spectra(
             min_pixels_per_segment=min_pixels_per_segment,
         )
     return results
-
-
