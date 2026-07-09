@@ -127,6 +127,45 @@ def load_swot_l2(filepath: str, ssh_var: str = "ssha_karin_2", hret: bool = True
         "cross_track_distance": xtrack,
     }
 
+
+def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True):
+    # NO type annotations — avoids Python 3.14 PEP 649 __annotate__ capture bug
+    ds = xr.open_dataset(filepath)
+    if HRET:
+        #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret'], dtype='float64')
+        ssha = (ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret']).values
+        #ssha = (ds[ssh_var] + ds['height_cor_xover']+ ds['internal_tide_hret']).values#.copy()
+    else:
+        ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'], dtype='float64')
+        #ssha = (ds[ssh_var] + ds['height_cor_xover']).values#.copy()
+    #ssha = ssha.astype('float64')   # string dtype, no builtins involved
+
+    for qual_name in (f'{ssh_var}_qual', 'ssha_karin_2_qual', 'ssh_karin_2_qual'):
+        if qual_name in ds.variables:
+            ssha = np.where(np.array(ds[qual_name]) == 0, ssha, np.nan)
+            #ssha = np.where(ds[qual_name].values == 0, ssha, np.nan)
+            break
+    for scf in ('ancillary_surface_classification_flag', 'surface_classification_flag'):
+        if scf in ds.variables:
+            ssha = np.where(np.array(ds[scf]) == 0, ssha, np.nan)
+            #ssha = np.where(ds[scf].values == 0, ssha, np.nan)
+            break
+    if 'surface_type' in ds.variables:
+        ssha = np.where(np.array(ds['surface_type']) == 0, ssha, np.nan)
+        #ssha = np.where(ds['surface_type'].values == 0, ssha, np.nan)
+
+    #lat = np.array(ds['latitude'], dtype='float64')
+    lat = ds['latitude'].values
+    #ds['latitude'].values.copy().astype('float64')
+    #lon = np.array(ds['longitude'], dtype='float64')
+    lon = ds['longitude'].values
+    #lon    = ds['longitude'].values.copy().astype('float64')
+    xtrack = np.array(ds['cross_track_distance'], dtype='float64')
+    xtrack = ds['cross_track_distance'].values
+    #xtrack = ds['cross_track_distance'].values.copy().astype('float64')
+    ds.close()
+    return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
+            'cross_track_distance': xtrack}
     # --------------------------------------------------------------------------- #
 # Geometry helpers
 # --------------------------------------------------------------------------- #
@@ -227,9 +266,10 @@ def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
     """Yield (i_start, i_end) index pairs splitting `distance_km` into
     along-track segments of length `segment_length_km`, with optional
     fractional overlap (0 <= overlap < 1)."""
-    if not (0.0 <= overlap < 1.0):
+    if (0.0 <= overlap < 1.0):
+        step_km = segment_length_km * (1.0 - overlap)
+    else:
         raise ValueError("overlap must be in [0, 1).")
-    step_km = segment_length_km * (1.0 - overlap)
     total = distance_km[-1]
     starts_km = np.arange(distance_km[0], total - segment_length_km + 1e-9, step_km)
     if len(starts_km) == 0:
@@ -311,7 +351,7 @@ def compute_swath_spectra(
     -------
     PassSpectrumResult
     """
-    ssha = np.asarray(ssha, dtype=np.float64)
+    #ssha = np.asarray(ssha, dtype=np.float64)
     cols = np.where(swath_mask)[0]
     if cols.size == 0:
         raise ValueError(f"No pixels found for swath '{swath_name}'.")
@@ -410,13 +450,20 @@ def compute_swath_spectra(
             wavenumber=freqs,
             psd=mean_pxx,
             n_pixels_used=n_pixels_used,
-            lat_mean=float(np.nanmean(seg_lat).item()),
-            lat_min=float(np.nanmin(seg_lat).item()),
-            lat_max=float(np.nanmax(seg_lat).item()),
-            lon_mean=float(np.nanmean(seg_lon).item()),
-            along_track_distance_start_km=float(seg_dist[0].item()),
-            along_track_distance_end_km=float(seg_dist[-1].item()),
-            valid_fraction=float(np.mean(valid_fracs)) if valid_fracs else 0.0,
+            #lat_mean=float(np.nanmean(seg_lat).item()),
+            #lat_min=float(np.nanmin(seg_lat).item()),
+            #lat_max=float(np.nanmax(seg_lat).item()),
+            #lon_mean=float(np.nanmean(seg_lon).item()),
+            #along_track_distance_start_km=float(seg_dist[0].item()),
+            #along_track_distance_end_km=float(seg_dist[-1].item()),
+            #valid_fraction=float(np.mean(valid_fracs)) if valid_fracs else 0.0,
+            lat_mean=np.nanmean(seg_lat).item(),
+            lat_min=np.nanmin(seg_lat).item(),
+            lat_max=np.nanmax(seg_lat).item(),
+            lon_mean=np.nanmean(seg_lon).item(),
+            along_track_distance_start_km=seg_dist[0].item(),
+            along_track_distance_end_km=seg_dist[-1].item(),
+            valid_fraction=np.mean(valid_fracs) if valid_fracs else 0.0,
             gap_filled=any_gap_filled,
         ))
 

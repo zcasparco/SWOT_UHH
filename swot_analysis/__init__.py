@@ -25,6 +25,7 @@ from .swot_alongtrack_spectra import (
     SegmentSpectrum,
     PassSpectrumResult,
     load_swot_l2,
+    load_swot_l2_expert,
     along_track_distance_km,
     split_left_right_swaths,
     compute_swath_spectra,
