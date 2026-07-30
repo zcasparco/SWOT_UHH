@@ -36,6 +36,7 @@ class SegmentSpectrum:
     along_track_distance_end_km: float
     valid_fraction: float       # fraction of non-NaN samples before fill
     gap_filled: bool            # whether interior NaNs were interpolated
+    month: int                  # month associated with swath
 
 
 @dataclasses.dataclass
@@ -48,6 +49,7 @@ class PassSpectrumResult:
     n_segments_used: int
     n_segments_total: int
     segments: list  # list[SegmentSpectrum]
+    month: int      # month associated with swath
 
     def segment_latitudes(self) -> np.ndarray:
         """Convenience: array of mean latitude for each retained segment."""
@@ -162,6 +164,7 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True):
     #lon    = ds['longitude'].values.copy().astype('float64')
     xtrack = np.array(ds['cross_track_distance'], dtype='float64')
     xtrack = ds['cross_track_distance'].values
+    #month = int(filepath[44])
     #xtrack = ds['cross_track_distance'].values.copy().astype('float64')
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
@@ -292,6 +295,7 @@ def compute_swath_spectra(
     latitude: np.ndarray,
     longitude: np.ndarray,
     swath_mask: np.ndarray,
+    month: int,
     swath_name: str,
     segment_length_km: float,
     along_track_spacing_km: Optional[float] = None,
@@ -315,6 +319,7 @@ def compute_swath_spectra(
     swath_mask : (num_pixels,) boolean array
         Pixel columns belonging to this swath (output of
         split_left_right_swaths).
+    month : (num_pixels,) int
     swath_name : str
         "left" or "right" (for bookkeeping only).
     segment_length_km : float
@@ -465,6 +470,7 @@ def compute_swath_spectra(
             along_track_distance_end_km=seg_dist[-1].item(),
             valid_fraction=np.mean(valid_fracs) if valid_fracs else 0.0,
             gap_filled=any_gap_filled,
+            month=month
         ))
 
     if segments:
@@ -481,6 +487,7 @@ def compute_swath_spectra(
         n_segments_used=len(segments),
         n_segments_total=len(bounds),
         segments=segments,
+        month=month,
     )
 
 
@@ -490,6 +497,7 @@ def compute_pass_spectra(
     longitude: np.ndarray,
     cross_track_distance: np.ndarray,
     segment_length_km: float,
+    month: int,
     along_track_spacing_km: Optional[float] = None,
     overlap: float = 0.0,
     max_gap_fraction: float = 0.25,
@@ -516,6 +524,7 @@ def compute_pass_spectra(
             latitude=latitude,
             longitude=longitude,
             swath_mask=mask,
+            month=month,
             swath_name=name,
             segment_length_km=segment_length_km,
             along_track_spacing_km=along_track_spacing_km,
