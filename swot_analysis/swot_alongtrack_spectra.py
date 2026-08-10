@@ -169,7 +169,67 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True):
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
             'cross_track_distance': xtrack}
-    # --------------------------------------------------------------------------- #
+
+def load_swot_l2_unsmoothed(filepath, ssh_var='ssha_karin_2', HRET=True):
+    """
+    Load the variables needed for spectral analysis from a SWOT L2 LR
+    Unsmoothed granule. Unlike the Expert product, Unsmoothed data is
+    split across two netCDF groups ('left' and 'right'); this function
+    merges them into the same flat (num_lines, num_pixels) layout used
+    by load_swot_l2_expert, so downstream code (compute_pass_spectra,
+    split_left_right_swaths) needs no changes.
+    """
+    def _load_group(group_name, flip):
+        ds = xr.open_dataset(filepath, group=group_name)
+
+        if HRET:
+            ssha = (ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret']).values
+        else:
+            ssha = np.array(ds[ssh_var] + ds['height_cor_xover'])
+
+        for qual_name in (f'{ssh_var}_qual', 'ssha_karin_2_qual', 'ssh_karin_2_qual'):
+            if qual_name in ds.variables:
+                ssha = np.where(np.array(ds[qual_name]) == 0, ssha, np.nan)
+                break
+        for scf in ('ancillary_surface_classification_flag', 'surface_classification_flag'):
+            if scf in ds.variables:
+                ssha = np.where(np.array(ds[scf]) == 0, ssha, np.nan)
+                break
+        if 'surface_type' in ds.variables:
+            ssha = np.where(np.array(ds['surface_type']) == 0, ssha, np.nan)
+
+        lat = ds['latitude'].values
+        lon = ds['longitude'].values
+        xtrack = np.array(ds['cross_track_distance'], dtype='float64')
+        # sign convention: negative = left swath, positive = right swath,
+        # matching what split_left_right_swaths() expects downstream
+        sign = -1.0 if group_name == 'left' else 1.0
+        xtrack = sign * np.abs(xtrack)
+
+        ds.close()
+
+        if flip:
+            ssha = ssha[:, ::-1]
+            lat = lat[:, ::-1]
+            lon = lon[:, ::-1]
+            xtrack = xtrack[:, ::-1] if xtrack.ndim == 2 else xtrack[::-1]
+
+        return ssha, lat, lon, xtrack
+
+    # left group's cross-track index runs right-to-left -> flip it so both
+    # groups increase with distance from nadir in the same direction
+    ssha_l, lat_l, lon_l, xtrack_l = _load_group('left', flip=True)
+    ssha_r, lat_r, lon_r, xtrack_r = _load_group('right', flip=False)
+
+    ssha = np.concatenate([ssha_l, ssha_r], axis=1)
+    lat = np.concatenate([lat_l, lat_r], axis=1)
+    lon = np.concatenate([lon_l, lon_r], axis=1)
+    xtrack = np.concatenate([xtrack_l, xtrack_r], axis=1) if xtrack_l.ndim == 2 \
+        else np.concatenate([xtrack_l, xtrack_r])
+
+    return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
+            'cross_track_distance': xtrack}
+# --------------------------------------------------------------------------- #
 # Geometry helpers
 # --------------------------------------------------------------------------- #
 
