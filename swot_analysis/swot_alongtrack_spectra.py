@@ -268,24 +268,46 @@ def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
                      overlap: float = 0.0):
     """Yield (i_start, i_end) index pairs splitting `distance_km` into
     along-track segments of length `segment_length_km`, with optional
-    fractional overlap (0 <= overlap < 1)."""
+    fractional overlap (0 <= overlap < 1).
+
+    A final segment is always anchored to the exact end of the track (in
+    addition to the regularly-stepped segments), so that up to
+    `segment_length_km` of data at the tail of every pass is not silently
+    dropped. Without this, since essentially every SWOT granule starts its
+    along-track distance count at very nearly the same orbital turning
+    latitude, the always-discarded tail lands at the same absolute
+    latitude for every file -- which shows up as a solid, uncovered
+    latitude band once results are aggregated across many
+    passes/granules, growing wider as segment_length_km increases.
+    """
     if (0.0 <= overlap < 1.0):
         step_km = segment_length_km * (1.0 - overlap)
     else:
         raise ValueError("overlap must be in [0, 1).")
     total = distance_km[-1]
-    starts_km = np.arange(distance_km[0], total - segment_length_km + 1e-9, step_km)
+    starts_km = list(np.arange(distance_km[0], total - segment_length_km + 1e-9, step_km))
     if len(starts_km) == 0:
         # pass shorter than one segment: use whole pass as a single segment
-        starts_km = np.array([distance_km[0]])
+        starts_km = [distance_km[0]]
+
+    # Anchor one final segment to the literal end of the track, even if it
+    # overlaps the previous segment more than the nominal step -- this
+    # guarantees full start-to-end coverage regardless of segment_length_km.
+    last_start_needed = total - segment_length_km
+    if last_start_needed > starts_km[-1] + 1e-9:
+        starts_km.append(last_start_needed)
 
     bounds = []
+    seen_i1 = set()
     for s_km in starts_km:
         e_km = s_km + segment_length_km
         i0 = int(np.searchsorted(distance_km, s_km, side="left"))
         i1 = int(np.searchsorted(distance_km, e_km, side="right"))
         if i1 - i0 < 8:  # need a minimum number of samples to FFT meaningfully
             continue
+        if i1 in seen_i1:  # avoid a near-duplicate segment when already reaching the end
+            continue
+        seen_i1.add(i1)
         bounds.append((i0, i1))
     return bounds
 
@@ -295,9 +317,9 @@ def compute_swath_spectra(
     latitude: np.ndarray,
     longitude: np.ndarray,
     swath_mask: np.ndarray,
-    month: int,
     swath_name: str,
     segment_length_km: float,
+    month: Optional[int] = None,
     along_track_spacing_km: Optional[float] = None,
     overlap: float = 0.0,
     max_gap_fraction: float = 0.25,
@@ -414,16 +436,31 @@ def compute_swath_spectra(
             if valid_frac < (1.0 - max_gap_fraction) or valid.sum() < 8:
                 continue  # too many gaps / land in this column -> skip it
 
-            # interpolate this column (in native sampling) onto the
-            # uniform grid; NaNs interpolated only between valid points,
-            # never extrapolated beyond the valid data range.
+            # Interpolate this column (in native sampling) onto the uniform
+            # grid. Interior gaps are filled by linear interpolation.
+            # Edge gaps (e.g. a coastline sitting right at one end of a
+            # long segment) are tolerated up to max_gap_fraction of the
+            # segment length: rather than discarding the whole column (and
+            # cascading to the whole segment) over a modest coastal margin,
+            # the edge is filled with the nearest valid value. Without
+            # this, large segment_length_km values make ANY segment that
+            # touches land at its very edge unusable in its entirety, even
+            # when the overwhelming majority of the segment is valid open
+            # ocean -- this disproportionately removes data at latitudes
+            # where coastlines commonly sit close to open ocean (e.g. the
+            # subtropical desert coasts around 20-30 deg latitude), and
+            # gets worse the longer the segment is.
             good_dist = seg_dist[valid]
             good_val = col[valid]
-            if good_dist[0] > uniform_dist[0] or good_dist[-1] < uniform_dist[-1]:
-                # uniform grid would require extrapolation -> skip column
+            edge_tol_km = max_gap_fraction * segment_length_km
+            needs_left_km = max(0.0, good_dist[0] - uniform_dist[0])
+            needs_right_km = max(0.0, uniform_dist[-1] - good_dist[-1])
+            if needs_left_km > edge_tol_km or needs_right_km > edge_tol_km:
+                # missing data at the edge exceeds the tolerance -> skip column
                 continue
 
-            resampled = np.interp(uniform_dist, good_dist, good_val)
+            resampled = np.interp(uniform_dist, good_dist, good_val,
+                                   left=good_val[0], right=good_val[-1])
             if valid_frac < 1.0:
                 any_gap_filled = True
 
@@ -497,13 +534,14 @@ def compute_pass_spectra(
     longitude: np.ndarray,
     cross_track_distance: np.ndarray,
     segment_length_km: float,
-    month: int,
+    month: Optional[int] = None,
     along_track_spacing_km: Optional[float] = None,
     overlap: float = 0.0,
     max_gap_fraction: float = 0.25,
     detrend: str = "linear",
     window: str = "hann",
     min_pixels_per_segment: int = 3,
+    
 ):
     """
     Compute along-track wavenumber

@@ -1,7 +1,10 @@
 README.md
 setup.py
 swot_analysis/__init__.py
+swot_analysis/binned_mean.py
 swot_analysis/plotting.py
+swot_analysis/swot_2d_spectra.py
+swot_analysis/swot_2d_spectra_synthetic.py
 swot_analysis/swot_alongtrack_slope.py
 swot_analysis/swot_alongtrack_spectra.py
 swot_analysis.egg-info/PKG-INFO
