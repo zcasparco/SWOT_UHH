@@ -130,7 +130,7 @@ def load_swot_l2(filepath: str, ssh_var: str = "ssha_karin_2", hret: bool = True
     }
 
 
-def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True):
+def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=False):
     # NO type annotations — avoids Python 3.14 PEP 649 __annotate__ capture bug
     ds = xr.open_dataset(filepath)
     if HRET:
@@ -150,25 +150,21 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True):
     for scf in ('ancillary_surface_classification_flag', 'surface_classification_flag'):
         if scf in ds.variables:
             ssha = np.where(np.array(ds[scf]) == 0, ssha, np.nan)
-            #ssha = np.where(ds[scf].values == 0, ssha, np.nan)
             break
     if 'surface_type' in ds.variables:
         ssha = np.where(np.array(ds['surface_type']) == 0, ssha, np.nan)
-        #ssha = np.where(ds['surface_type'].values == 0, ssha, np.nan)
-
-    #lat = np.array(ds['latitude'], dtype='float64')
     lat = ds['latitude'].values
-    #ds['latitude'].values.copy().astype('float64')
-    #lon = np.array(ds['longitude'], dtype='float64')
     lon = ds['longitude'].values
-    #lon    = ds['longitude'].values.copy().astype('float64')
-    xtrack = np.array(ds['cross_track_distance'], dtype='float64')
     xtrack = ds['cross_track_distance'].values
-    #month = int(filepath[44])
-    #xtrack = ds['cross_track_distance'].values.copy().astype('float64')
+    
+    if swh_var:
+        swh = np.where(np.array(ds['swh_karin_qual'])==0, np.array(ds['swh_karin']), np.nan)
+        ssha = np.where(swh<=6,ssha,np.nan)
+        
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
-            'cross_track_distance': xtrack}
+                'cross_track_distance': xtrack}
+        
 
 def load_swot_l2_unsmoothed(filepath, ssh_var='ssha_karin_2', HRET=True):
     """
