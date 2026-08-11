@@ -476,9 +476,13 @@ def compute_swath_spectra(
         uniform_dist = (seg_dist[0]
                          + np.arange(nperseg) * along_track_spacing_km)
         # discard segment if the uniform grid runs past available data
-        if uniform_dist[-1] > seg_dist[-1] + along_track_spacing_km:
+        #if uniform_dist[-1] > seg_dist[-1] + along_track_spacing_km:
+        #    continue
+        
+        # was: along_track_spacing_km
+        overrun_tol_km = max(along_track_spacing_km * 10, 0.01 * segment_length_km)
+        if uniform_dist[-1] > seg_dist[-1] + overrun_tol_km:
             continue
-
         col_psds = []
         any_gap_filled = False
         valid_fracs = []
@@ -515,8 +519,11 @@ def compute_swath_spectra(
                 # missing data at the edge exceeds the tolerance -> skip column
                 continue
 
+            #resampled = np.interp(uniform_dist, good_dist, good_val,
+            #                       left=good_val[0], right=good_val[-1])
             resampled = np.interp(uniform_dist, good_dist, good_val,
-                                   left=good_val[0], right=good_val[-1])
+                       left=good_val[0], right=good_val[-1])
+            
             if valid_frac < 1.0:
                 any_gap_filled = True
 
