@@ -159,7 +159,7 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=Fal
     
     if swh_var:
         swh = np.where(np.array(ds['swh_karin_qual'])==0, np.array(ds['swh_karin']), np.nan)
-        ssha = np.where(swh<=6,ssha,np.nan)
+        ssha = np.where(swh<=5,ssha,np.nan)
         
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
