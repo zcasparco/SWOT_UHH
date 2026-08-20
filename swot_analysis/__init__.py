@@ -32,6 +32,8 @@ from .swot_alongtrack_spectra import (
     compute_swath_spectra,
     compute_pass_spectra,
 )
+from . import swot_alias_spectra
+from . import swot_alias_wrapper
 
 #from .swot_alongtrack_slope import (
 #    SwathSlopeResult,
@@ -62,4 +64,6 @@ __all__ = [
     "compute_pass_slope",
     "compute_swath_slope_spectrum",
     "__version__",
+    "swot_alias_spectra",
+    "swot_alias_wrapper"
 ]
