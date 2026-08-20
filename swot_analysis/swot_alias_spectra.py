@@ -361,27 +361,40 @@ def _segment_bounds_at_latitudes(
 def _max_contiguous_gap_fraction(
     patch: np.ndarray,
     axis: int = 0,
+    row_bad_threshold: float = 0.5,
 ) -> float:
     """
-    Longest contiguous run of missing (NaN) samples along `axis`,
-    expressed as a fraction of that axis's length -- the worst case found
-    anywhere in the patch (i.e. the single longest run in any row/column).
+    Longest contiguous run of "mostly missing" rows (or columns, if
+    axis=1), expressed as a fraction of that axis's length.
 
-    This is deliberately a different check from a total NaN *fraction*:
-    a patch can be well under `max_nan_fraction` overall while still
-    containing one long, spatially-contiguous void -- a coastline cutting
-    across the swath, an island, an orbit/instrument dropout -- and that
-    is exactly the situation where linear interpolation (`_fill_nan_2d`)
-    is least trustworthy: it silently draws a straight line across a real
-    physical gap, which suppresses genuine small-scale variance there and
-    can inject spurious low-wavenumber ramp energy. Segments are screened
-    on this metric (via `max_gap_fraction`) *before* any filling happens,
-    so land/coastal voids and large gaps get dropped rather than
-    interpolated over.
+    A row is "mostly missing" when more than `row_bad_threshold` of its
+    entries (across the *other* dimension) are NaN. This is a majority
+    vote across the cross-track width, not a per-pixel check -- so a
+    small number of chronically-flagged pixels (e.g. a persistently-bad
+    near-nadir or far-swath edge column, common in real quality-flagged
+    altimetry data) do not, by themselves, poison the metric. What this
+    is meant to catch is the case where the swath is *genuinely* blocked
+    for a stretch of along-track samples -- a coastline cutting across
+    most of the swath, an island, an orbit/instrument dropout -- which is
+    exactly the situation where linear interpolation (`_fill_nan_2d`) is
+    least trustworthy: it silently draws a straight line across a real
+    physical gap, suppressing genuine small-scale variance there and
+    potentially injecting spurious low-wavenumber ramp energy. Segments
+    are screened on this metric (via `max_gap_fraction`) *before* any
+    filling happens, so land/coastal voids and large gaps get dropped
+    rather than interpolated over.
 
-    axis=0 (default) checks along-track runs (the along-track spectrum is
-    what this codebase estimates, so this is the metric that matters most
-    for spectral bias); axis=1 checks cross-track runs.
+    Using a single chronically-bad pixel's run length here (rather than a
+    row-majority vote) was tried first and turned out to be far too
+    aggressive in practice: a single always-NaN column anywhere in the
+    patch (again, a routine occurrence, not a real gap) drives that
+    column's run length to 100% of the segment, which rejects every
+    segment in the file regardless of the actual data quality.
+
+    axis=0 (default) checks along-track runs of mostly-blocked rows (the
+    along-track spectrum is what this codebase estimates, so this is the
+    metric that matters most for spectral bias); axis=1 checks
+    cross-track runs of mostly-blocked columns.
     """
 
     mask = np.isnan(patch)
@@ -389,21 +402,25 @@ def _max_contiguous_gap_fraction(
     if axis == 1:
         mask = mask.T
 
-    n = mask.shape[0]
+    n, width = mask.shape
 
-    if n == 0 or mask.size == 0:
+    if n == 0 or width == 0:
         return 0.0
 
-    # Running length of the current True-streak in each column, reset to
-    # zero wherever the mask is False. Vectorized across columns; only
-    # loops over rows (cheap: rows are the along-track dimension, but the
-    # loop itself is O(n_rows), not O(n_rows * n_cols)).
-    m = mask.astype(np.int64)
-    run = np.empty_like(m)
-    run[0] = m[0]
+    row_nan_fraction = mask.mean(axis=1)
+    row_bad = row_nan_fraction > row_bad_threshold
+
+    if not row_bad.any():
+        return 0.0
+
+    # Longest contiguous run of True in row_bad (1-D run-length via a
+    # reset-on-False cumulative counter).
+    b = row_bad.astype(np.int64)
+    run = np.empty_like(b)
+    run[0] = b[0]
 
     for i in range(1, n):
-        run[i] = (run[i - 1] + m[i]) * m[i]
+        run[i] = (run[i - 1] + b[i]) * b[i]
 
     return float(run.max()) / n
 
