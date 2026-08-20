@@ -21,10 +21,9 @@ INPUT_FILE = Path(
     "/path/to/SWOT_L2_LR_SSH_..._Unsmoothed.nc"
 )
 
-OUTPUT_FILE = None
-#Path(
-#    "/path/to/swot_alias_spectra.pkl"
-#)
+OUTPUT_FILE = Path(
+    "/path/to/swot_alias_spectra.pkl"
+)
 
 
 # -----------------------------------------------------------------------------
@@ -35,6 +34,7 @@ SEGMENT_LENGTH_KM = 200.0
 OVERLAP = 0.0
 
 MAX_NAN_FRACTION = 0.15
+MAX_GAP_FRACTION = 0.1
 
 N_TAPS = 9
 
@@ -81,6 +81,7 @@ def process_one_file(
     segment_length_km: float = SEGMENT_LENGTH_KM,
     overlap: float = OVERLAP,
     max_nan_fraction: float = MAX_NAN_FRACTION,
+    max_gap_fraction: float = MAX_GAP_FRACTION,
     n_taps: int = N_TAPS,
     dx1_native_km: float = DX1_NATIVE_KM,
     dx2_native_km: float = DX2_NATIVE_KM,
@@ -94,9 +95,10 @@ def process_one_file(
     lon_max: float = LON_MAX,
     hret: bool = True,
     ssh_var: str = "ssha_karin_2",
+    verbose: bool = False,
+    return_counts: bool = False,
     # Accepted for backwards compatibility with older notebook cells; not
     # currently used by the alias-decomposition itself.
-    max_gap_fraction=None,
     max_patches=None,
     band_km=None,
 ):
@@ -114,6 +116,34 @@ def process_one_file(
     ``swot_alias_spectra._resolve_segment_sampling``), so segments from
     many files can always be stacked/concatenated together, e.g. via
     ``swot_alias_spectra.segments_to_dataset``.
+
+    NaN handling (land, coastlines, gaps)
+    --------------------------------------
+    Two independent thresholds gate which candidate segments are kept, so
+    land, coastal voids, and large data gaps can't sneak past a single
+    check and get linearly interpolated over:
+
+    - ``max_nan_fraction``: drops a segment if its *total* fraction of
+      missing samples is too high (segments over/mostly-over land).
+    - ``max_gap_fraction``: drops a segment if its longest single
+      *contiguous* along-track run of missing samples is too large, even
+      if the total fraction is fine -- this is what catches a coastline
+      or orbit gap that would otherwise pass ``max_nan_fraction`` and get
+      silently smoothed over by linear interpolation, damping small-scale
+      spectral content. See ``compute_alias_swath_spectra`` for details.
+
+    Only segments passing both checks are gap-filled (short, scattered
+    per-pixel dropouts only) and used.
+
+    If ``verbose`` is True, a one-line-per-swath summary of how many
+    candidate segments were kept/dropped (and why) is printed -- the same
+    counts are always included in the pickled payload's
+    ``"segment_counts"`` when ``output_path`` is given.
+
+    If ``return_counts`` is True, returns ``(result, segment_counts)``
+    instead of just ``result`` -- useful when a caller wants the
+    kept/dropped diagnostics per file (e.g. for a batch-run manifest)
+    without also having to write/re-read a pickle.
 
     If ``output_path`` is given, the full result (including the per-swath
     ``AliasPassSpectrumResult`` objects, a packed ``xarray.Dataset`` of the
@@ -142,6 +172,7 @@ def process_one_file(
         overlap=overlap,
 
         max_nan_fraction=max_nan_fraction,
+        max_gap_fraction=max_gap_fraction,
 
         n_taps=n_taps,
 
@@ -165,6 +196,33 @@ def process_one_file(
         for swath in ("left", "right")
     }
 
+    # Segment counts/diagnostics per swath, mainly useful for QC across a
+    # large batch of files: how many candidate segments were dropped, and
+    # for which of the two independent NaN-related reasons (total fraction
+    # vs. a large contiguous gap -- see compute_alias_swath_spectra).
+    segment_counts = {
+        swath: {
+            "n_segments_total": by_swath[swath].n_segments_total,
+            "n_segments_used": by_swath[swath].n_segments_used,
+            "n_segments_dropped_nan_fraction": by_swath[swath].n_segments_dropped_nan_fraction,
+            "n_segments_dropped_gap": by_swath[swath].n_segments_dropped_gap,
+            "n_segments_dropped_fill_failed": by_swath[swath].n_segments_dropped_fill_failed,
+            "n_segments_dropped_decompose_failed": by_swath[swath].n_segments_dropped_decompose_failed,
+        }
+        for swath in ("left", "right")
+    }
+
+    if verbose:
+        for swath in ("left", "right"):
+            c = segment_counts[swath]
+            print(
+                f"{swath:5s}: kept {c['n_segments_used']}/{c['n_segments_total']}  "
+                f"(dropped: nan_fraction={c['n_segments_dropped_nan_fraction']}, "
+                f"gap={c['n_segments_dropped_gap']}, "
+                f"fill_failed={c['n_segments_dropped_fill_failed']}, "
+                f"decompose_failed={c['n_segments_dropped_decompose_failed']})"
+            )
+
     if output_path is not None:
 
         output_path = Path(output_path)
@@ -184,6 +242,7 @@ def process_one_file(
             "segments": all_segments,
             "dataset": dataset,
             "by_swath": by_swath,
+            "segment_counts": segment_counts,
             "metadata": {
                 "input_file": str(unsmoothed_path),
                 "segment_length_km": segment_length_km,
@@ -194,12 +253,16 @@ def process_one_file(
                 "dx2_expert_km": dx2_expert_km,
                 "n_taps": n_taps,
                 "max_nan_fraction": max_nan_fraction,
+                "max_gap_fraction": max_gap_fraction,
                 "remove_plane": remove_plane,
             },
         }
 
         with open(output_path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    if return_counts:
+        return result, segment_counts
 
     return result
 
@@ -222,6 +285,7 @@ def main():
         overlap=OVERLAP,
 
         max_nan_fraction=MAX_NAN_FRACTION,
+        max_gap_fraction=MAX_GAP_FRACTION,
         n_taps=N_TAPS,
 
         dx1_native_km=DX1_NATIVE_KM,
@@ -236,6 +300,8 @@ def main():
         lat_max=LAT_MAX,
         lon_min=LON_MIN,
         lon_max=LON_MAX,
+
+        verbose=True,
     )
 
     print()

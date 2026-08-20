@@ -60,6 +60,7 @@ class AliasSegmentSpectrum:
     direct_energy: Optional[float] = None
     aliased_energy: Optional[float] = None
     aliased_fraction: Optional[float] = None
+    gap_fraction: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -80,6 +81,15 @@ class AliasPassSpectrumResult:
     n_segments_total: int
 
     month: Optional[int] = None
+
+    # Diagnostics: how many candidate segments were dropped, and why.
+    # Populated by compute_alias_swath_spectra; useful for sanity-checking
+    # NaN/gap handling across a large batch of files without having to
+    # inspect every segment.
+    n_segments_dropped_nan_fraction: int = 0
+    n_segments_dropped_gap: int = 0
+    n_segments_dropped_fill_failed: int = 0
+    n_segments_dropped_decompose_failed: int = 0
 
     def segment_latitudes(self) -> np.ndarray:
         return np.array([s.lat_mean for s in self.segments])
@@ -348,12 +358,71 @@ def _segment_bounds_at_latitudes(
 # Gap handling
 # ============================================================================
 
+def _max_contiguous_gap_fraction(
+    patch: np.ndarray,
+    axis: int = 0,
+) -> float:
+    """
+    Longest contiguous run of missing (NaN) samples along `axis`,
+    expressed as a fraction of that axis's length -- the worst case found
+    anywhere in the patch (i.e. the single longest run in any row/column).
+
+    This is deliberately a different check from a total NaN *fraction*:
+    a patch can be well under `max_nan_fraction` overall while still
+    containing one long, spatially-contiguous void -- a coastline cutting
+    across the swath, an island, an orbit/instrument dropout -- and that
+    is exactly the situation where linear interpolation (`_fill_nan_2d`)
+    is least trustworthy: it silently draws a straight line across a real
+    physical gap, which suppresses genuine small-scale variance there and
+    can inject spurious low-wavenumber ramp energy. Segments are screened
+    on this metric (via `max_gap_fraction`) *before* any filling happens,
+    so land/coastal voids and large gaps get dropped rather than
+    interpolated over.
+
+    axis=0 (default) checks along-track runs (the along-track spectrum is
+    what this codebase estimates, so this is the metric that matters most
+    for spectral bias); axis=1 checks cross-track runs.
+    """
+
+    mask = np.isnan(patch)
+
+    if axis == 1:
+        mask = mask.T
+
+    n = mask.shape[0]
+
+    if n == 0 or mask.size == 0:
+        return 0.0
+
+    # Running length of the current True-streak in each column, reset to
+    # zero wherever the mask is False. Vectorized across columns; only
+    # loops over rows (cheap: rows are the along-track dimension, but the
+    # loop itself is O(n_rows), not O(n_rows * n_cols)).
+    m = mask.astype(np.int64)
+    run = np.empty_like(m)
+    run[0] = m[0]
+
+    for i in range(1, n):
+        run[i] = (run[i - 1] + m[i]) * m[i]
+
+    return float(run.max()) / n
+
+
 def _fill_nan_2d(
     patch: np.ndarray,
     max_nan_fraction: float = 0.15,
 ):
     """
     Fill small 2-D NaN gaps using row then column interpolation.
+
+    This performs *linear* interpolation across gaps, which is only a
+    reasonable approximation for short, scattered gaps (typical KaRIn
+    per-pixel dropouts). It is not, by itself, gap-size aware -- callers
+    are expected to have already screened out patches with large
+    contiguous voids (land, coastlines, orbit gaps) via
+    `_max_contiguous_gap_fraction` / `max_gap_fraction` before calling
+    this, since interpolating across a large real gap silently damps the
+    small-scale spectral content that this codebase is trying to measure.
     """
 
     patch = np.asarray(patch, dtype=float).copy()
@@ -654,6 +723,7 @@ def compute_alias_swath_spectra(
     month: Optional[int] = None,
     overlap: float = 0.0,
     max_nan_fraction: float = 0.15,
+    max_gap_fraction: float = 0.1,
     n_taps: int = 9,
     remove_plane: bool = True,
     center_latitudes: Optional[Sequence[float]] = None,
@@ -668,6 +738,30 @@ def compute_alias_swath_spectra(
     decomposition's output axis length is identical for every segment --
     including segments from other swaths/files processed with the same
     parameters.
+
+    NaN handling (land, coastlines, gaps)
+    --------------------------------------
+    Each candidate segment is screened by two independent, complementary
+    checks before any gap-filling happens:
+
+    - `max_nan_fraction`: total fraction of missing samples in the
+      segment. Segments over land, or mostly over land, have a high total
+      NaN fraction and are dropped here regardless of the gap's shape.
+    - `max_gap_fraction`: the length of the single longest *contiguous*
+      along-track run of missing samples, as a fraction of the segment
+      length. This catches the case `max_nan_fraction` alone cannot: a
+      segment that is well under the total-NaN budget but contains one
+      large, spatially-contiguous void (a coastline cutting across the
+      swath, an island, an orbit/instrument dropout). Such a void, if
+      left to `_fill_nan_2d`'s linear interpolation, would silently draw
+      a straight line across a real physical gap -- damping genuine
+      small-scale variance there and biasing exactly the along-track
+      wavenumber spectrum this function is trying to estimate.
+
+    Only segments passing *both* checks reach `_fill_nan_2d`, so the
+    linear interpolation it performs is only ever applied to short,
+    scattered gaps (typical KaRIn per-pixel dropouts) -- the case it's
+    actually a reasonable approximation for.
     """
 
     n_lines_patch, Ma, n1e_target = _resolve_segment_sampling(
@@ -720,6 +814,11 @@ def compute_alias_swath_spectra(
 
     segments = []
 
+    n_dropped_nan_fraction = 0
+    n_dropped_gap = 0
+    n_dropped_fill_failed = 0
+    n_dropped_decompose_failed = 0
+
     for segment_index, (i0, i1) in enumerate(bounds):
 
         patch = sub_ssha[i0:i1, :]
@@ -729,6 +828,18 @@ def compute_alias_swath_spectra(
         )
 
         if valid_fraction < 1.0 - max_nan_fraction:
+            n_dropped_nan_fraction += 1
+            continue
+
+        # Gate on the largest contiguous along-track gap BEFORE any
+        # filling: this is what actually catches land/coastal voids and
+        # large data gaps that would otherwise pass the total-fraction
+        # check above and get silently interpolated over. See the
+        # NaN-handling note in this function's docstring.
+        gap_fraction = _max_contiguous_gap_fraction(patch, axis=0)
+
+        if gap_fraction > max_gap_fraction:
+            n_dropped_gap += 1
             continue
 
         filled = _fill_nan_2d(
@@ -737,6 +848,7 @@ def compute_alias_swath_spectra(
         )
 
         if filled is None:
+            n_dropped_fill_failed += 1
             continue
 
         gap_filled = np.isnan(patch).any()
@@ -754,6 +866,7 @@ def compute_alias_swath_spectra(
         )
 
         if result is None:
+            n_dropped_decompose_failed += 1
             continue
 
         k, direct, aliased, total = result
@@ -794,6 +907,7 @@ def compute_alias_swath_spectra(
 
                 valid_fraction=valid_fraction,
                 gap_filled=gap_filled,
+                gap_fraction=gap_fraction,
             )
         )
 
@@ -841,6 +955,10 @@ def compute_alias_swath_spectra(
             n_segments_used=0,
             n_segments_total=len(bounds),
             month=month,
+            n_segments_dropped_nan_fraction=n_dropped_nan_fraction,
+            n_segments_dropped_gap=n_dropped_gap,
+            n_segments_dropped_fill_failed=n_dropped_fill_failed,
+            n_segments_dropped_decompose_failed=n_dropped_decompose_failed,
         )
 
     k = segments[0].wavenumber
@@ -872,6 +990,11 @@ def compute_alias_swath_spectra(
         n_segments_total=len(bounds),
 
         month=month,
+
+        n_segments_dropped_nan_fraction=n_dropped_nan_fraction,
+        n_segments_dropped_gap=n_dropped_gap,
+        n_segments_dropped_fill_failed=n_dropped_fill_failed,
+        n_segments_dropped_decompose_failed=n_dropped_decompose_failed,
     )
 
 
@@ -889,6 +1012,7 @@ def compute_alias_pass_spectra(
     month: Optional[int] = None,
     overlap: float = 0.0,
     max_nan_fraction: float = 0.15,
+    max_gap_fraction: float = 0.1,
     n_taps: int = 9,
     remove_plane: bool = True,
     remove_edges_km: Optional[float] = None,
@@ -896,6 +1020,14 @@ def compute_alias_pass_spectra(
 ):
     """
     Compute direct, aliased and total spectra for both SWOT swaths.
+
+    See `compute_alias_swath_spectra` for the NaN/gap-handling contract:
+    `max_nan_fraction` bounds the total missing-data fraction per segment
+    (drops segments mostly/entirely over land), and `max_gap_fraction`
+    separately bounds the longest *contiguous* along-track gap (drops
+    segments with a large coastal/orbit void even when the total NaN
+    fraction is otherwise fine). Only segments passing both are gap-filled
+    and used.
     """
 
     left_mask, right_mask = split_left_right_swaths(
@@ -933,6 +1065,7 @@ def compute_alias_pass_spectra(
             month=month,
             overlap=overlap,
             max_nan_fraction=max_nan_fraction,
+            max_gap_fraction=max_gap_fraction,
             n_taps=n_taps,
 
             remove_plane=remove_plane,
@@ -1223,6 +1356,17 @@ def segments_to_dataset(
             n_pixels=(["segment"], [s.n_pixels for s in segments]),
             valid_fraction=(["segment"], [s.valid_fraction for s in segments]),
             gap_filled=(["segment"], [bool(s.gap_filled) for s in segments]),
+            gap_fraction=(
+                ["segment"],
+                [
+                    s.gap_fraction if s.gap_fraction is not None else np.nan
+                    for s in segments
+                ],
+                {
+                    "long_name": "Longest contiguous along-track NaN run, "
+                                  "as a fraction of the segment length",
+                },
+            ),
             swath=(["segment"], [s.swath for s in segments]),
             segment_index=(["segment"], [s.segment_index for s in segments]),
         ),
