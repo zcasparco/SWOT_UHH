@@ -38,6 +38,22 @@ class SegmentSpectrum:
     gap_filled: bool            # whether interior NaNs were interpolated
     month: int                  # month associated with swath
 
+    # --- Optional 2-D (along-track x cross-track), cross-track-integrated
+    # spectrum -- only populated when compute_swath_spectra() /
+    # compute_pass_spectra() is called with cross_track_integrated=True.
+    # This is computed differently from `psd` above (which averages
+    # independent 1-D column periodograms): here a single 2-D periodogram
+    # is taken over the whole (along-track x cross-track) segment patch
+    # and integrated over cross-track wavenumber, the same recipe used
+    # for the "total" (direct + aliased) spectrum in
+    # swot_alias_spectra.py, at native (undecimated) resolution -- so
+    # this is the field to use when comparing against that script's
+    # output rather than `psd`.
+    wavenumber_2d: Optional[np.ndarray] = None
+    psd_2d: Optional[np.ndarray] = None
+    n_cols_2d: Optional[int] = None    # cross-track columns in the 2-D patch after gap-filling
+    dx2_km_2d: Optional[float] = None  # cross-track spacing used for the 2-D patch
+
 
 @dataclasses.dataclass
 class PassSpectrumResult:
@@ -50,6 +66,13 @@ class PassSpectrumResult:
     n_segments_total: int
     segments: list  # list[SegmentSpectrum]
     month: int      # month associated with swath
+
+    # --- Optional 2-D cross-track-integrated pass-mean spectrum; see
+    # SegmentSpectrum.psd_2d. None unless cross_track_integrated=True was
+    # passed to compute_swath_spectra() / compute_pass_spectra().
+    wavenumber_2d: Optional[np.ndarray] = None
+    mean_psd_2d: Optional[np.ndarray] = None
+    n_segments_used_2d: int = 0
 
     def segment_latitudes(self) -> np.ndarray:
         """Convenience: array of mean latitude for each retained segment."""
@@ -368,6 +391,132 @@ def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
     return bounds
 
 
+# --------------------------------------------------------------------------- #
+# Optional: 2-D (along-track x cross-track), cross-track-integrated PSD
+# --------------------------------------------------------------------------- #
+#
+# The default computation above (`psd` / `mean_psd`) estimates the
+# along-track spectrum by taking an independent 1-D periodogram of each
+# cross-track pixel column and averaging over columns. That is NOT the
+# same estimator as swot_alias_spectra.py's `total_psd`, which instead
+# takes a single 2-D periodogram of the whole (along-track x cross-track)
+# patch and integrates over cross-track wavenumber. The two give similar
+# but not identical results (the 2-D estimator, via the cross-track Hann
+# taper, correlates information across columns rather than treating them
+# as independent realizations), so a like-for-like comparison against the
+# alias-decomposition script's spectra needs this second estimator, which
+# these helpers add as an opt-in (see `cross_track_integrated` below).
+
+def _fill_nan_2d(patch: np.ndarray, max_nan_fraction: float = 0.15):
+    """
+    Fill small 2-D NaN gaps using row-then-column linear interpolation.
+    Returns None if the patch exceeds max_nan_fraction, or if any NaNs
+    remain after filling (e.g. an entire row/column with no valid
+    neighbours) -- mirrors `swot_alias_spectra._fill_nan_2d`.
+    """
+    patch = np.asarray(patch, dtype=float).copy()
+
+    if np.isnan(patch).mean() > max_nan_fraction:
+        return None
+
+    for i in range(patch.shape[0]):
+        row = patch[i]
+        if np.isnan(row).any() and not np.isnan(row).all():
+            patch[i] = _interp_nan_1d(row)
+
+    for j in range(patch.shape[1]):
+        col = patch[:, j]
+        if np.isnan(col).any() and not np.isnan(col).all():
+            patch[:, j] = _interp_nan_1d(col)
+
+    if np.isnan(patch).any():
+        return None
+
+    return patch
+
+
+def _plane_detrend_2d(patch: np.ndarray) -> np.ndarray:
+    """Remove a best-fit 2-D plane (mirrors swot_alias_spectra.plane_detrend_2d)."""
+    n1, n2 = patch.shape
+    y, x = np.mgrid[0:n1, 0:n2]
+    A = np.column_stack([np.ones(n1 * n2), x.ravel(), y.ravel()])
+    coeffs, *_ = np.linalg.lstsq(A, patch.ravel(), rcond=None)
+    return patch - (A @ coeffs).reshape(n1, n2)
+
+
+def _periodogram_2d_cross_track_integrated(
+    patch: np.ndarray,
+    dx1_km: float,
+    dx2_km: float,
+    window: str = "hann",
+):
+    """
+    2-D Hann(-or-other)-tapered periodogram of `patch`, integrated over
+    cross-track wavenumber to give a 1-D along-track PSD. Same recipe as
+    `swot_alias_spectra.periodogram_2d` followed by its cross-track
+    integration step, without any Expert-resolution filtering/aliasing
+    decomposition -- i.e. this is the native-resolution "total" spectrum
+    swot_alias_spectra.py would call `total_psd`.
+
+    Returns
+    -------
+    k1 : one-sided along-track wavenumber (cycles/km)
+    psd_1d : cross-track-integrated along-track PSD, (SSH units)^2/(cycles/km)
+    """
+    n1, n2 = patch.shape
+
+    w1 = signal.get_window(window, n1)
+    w2 = signal.get_window(window, n2)
+    win2d = np.outer(w1, w2)
+    norm = np.mean(win2d ** 2)
+
+    F = np.fft.fft2(patch * win2d)
+    S2D = (dx1_km * dx2_km / (n1 * n2)) * np.abs(F) ** 2 / norm
+
+    k1 = np.fft.fftfreq(n1, dx1_km)
+    k2 = np.fft.fftfreq(n2, dx2_km)
+    dk2 = np.abs(k2[1] - k2[0]) if n2 > 1 else 1.0
+
+    total_1d = S2D.sum(axis=1) * dk2
+
+    positive = k1 >= 0
+    k = k1[positive]
+    total = total_1d[positive].copy()
+
+    # DC and Nyquist are not doubled when folding to one-sided.
+    interior = (k > 0) & (k < np.max(np.abs(k1)))
+    total[interior] *= 2.0
+
+    return k, total
+
+
+def _estimate_dx2_km(cross_track_distance: Optional[np.ndarray], cols: np.ndarray):
+    """
+    Estimate the (approximately uniform) cross-track pixel spacing in km
+    for the given swath columns, from the cross_track_distance array.
+    Returns None if it can't be estimated (caller should fall back to an
+    explicit dx2_km or skip the 2-D computation).
+    """
+    if cross_track_distance is None:
+        return None
+
+    xt = np.asarray(cross_track_distance, dtype=float)
+    if xt.ndim == 2:
+        xt = np.nanmedian(xt, axis=0)
+
+    sub = xt[cols]
+    sub = sub[np.isfinite(sub)]
+    if sub.size < 2:
+        return None
+
+    diffs = np.abs(np.diff(np.sort(sub)))
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+
+    return float(np.median(diffs))
+
+
 def compute_swath_spectra(
     ssha: np.ndarray,
     latitude: np.ndarray,
@@ -382,6 +531,12 @@ def compute_swath_spectra(
     detrend: str = "linear",
     window: str = "hann",
     min_pixels_per_segment: int = 3,
+    cross_track_integrated: bool = False,
+    cross_track_distance: Optional[np.ndarray] = None,
+    dx2_km: Optional[float] = None,
+    max_nan_fraction_2d: float = 0.15,
+    remove_plane_2d: bool = True,
+    window_2d: str = "hann",
 ) -> PassSpectrumResult:
     """
     Compute along-track wavenumber spectra for ONE swath (left or right)
@@ -429,6 +584,39 @@ def compute_swath_spectra(
     min_pixels_per_segment : int
         Minimum number of valid cross-track pixel columns required to
         keep a segment.
+    cross_track_integrated : bool
+        If True, ALSO compute a 2-D (along-track x cross-track),
+        cross-track-integrated PSD per segment (`SegmentSpectrum.psd_2d`
+        / `PassSpectrumResult.mean_psd_2d`), using the same 2-D
+        periodogram + cross-track-integration recipe as the "total"
+        (native-resolution) spectrum in swot_alias_spectra.py -- this is
+        the field to use for a like-for-like comparison against that
+        script's output, rather than the default `psd`/`mean_psd`
+        (which averages independent 1-D column periodograms and is a
+        different, if related, estimator). Off by default: it is
+        additional computation on top of the default along-track
+        spectrum, not a replacement for it.
+    cross_track_distance : array, optional
+        Needed only when cross_track_integrated=True and dx2_km is not
+        given explicitly -- used to estimate the physical cross-track
+        pixel spacing for this swath.
+    dx2_km : float, optional
+        Cross-track pixel spacing in km, used only when
+        cross_track_integrated=True. If None, estimated from
+        cross_track_distance.
+    max_nan_fraction_2d : float
+        Total NaN-fraction threshold for the 2-D segment patch (analogous
+        to swot_alias_spectra's max_nan_fraction); only used when
+        cross_track_integrated=True. Segments exceeding this have no
+        psd_2d (left as None) but are otherwise unaffected -- the default
+        1-D `psd` for that segment is still computed as usual.
+    remove_plane_2d : bool
+        Remove a best-fit 2-D plane from the segment patch before the 2-D
+        periodogram, matching swot_alias_spectra's default
+        (remove_plane=True). Only used when cross_track_integrated=True.
+    window_2d : str
+        Taper window (both dimensions) for the 2-D periodogram. Only used
+        when cross_track_integrated=True.
 
     Returns
     -------
@@ -442,6 +630,16 @@ def compute_swath_spectra(
     sub_ssha = ssha[:, cols]
     sub_lat = latitude[:, cols]
     sub_lon = longitude[:, cols]
+
+    dx2_km_resolved = dx2_km
+    if cross_track_integrated and dx2_km_resolved is None:
+        dx2_km_resolved = _estimate_dx2_km(cross_track_distance, cols)
+        if dx2_km_resolved is None:
+            raise ValueError(
+                "cross_track_integrated=True requires either dx2_km or a "
+                "usable cross_track_distance to estimate it from, and "
+                f"neither was usable for swath '{swath_name}'."
+            )
 
     distance_km = along_track_distance_km(sub_lat, sub_lon)
 
@@ -487,6 +685,11 @@ def compute_swath_spectra(
         any_gap_filled = False
         valid_fracs = []
 
+        patch_2d = (
+            np.full((nperseg, seg_ssha.shape[1]), np.nan)
+            if cross_track_integrated else None
+        )
+
         for c in range(seg_ssha.shape[1]):
             col = seg_ssha[:, c]
             valid = ~np.isnan(col)
@@ -523,7 +726,15 @@ def compute_swath_spectra(
             #                       left=good_val[0], right=good_val[-1])
             resampled = np.interp(uniform_dist, good_dist, good_val,
                        left=good_val[0], right=good_val[-1])
-            
+
+            if patch_2d is not None:
+                # Raw (non-detrended) resampled column -- the 2-D patch
+                # gets a single plane-detrend applied once, over the
+                # whole patch, after gap-filling (see below), rather
+                # than per-column detrending, to match
+                # swot_alias_spectra's convention.
+                patch_2d[:, c] = resampled
+
             if valid_frac < 1.0:
                 any_gap_filled = True
 
@@ -549,6 +760,28 @@ def compute_swath_spectra(
 
         mean_pxx = np.mean(np.stack(col_psds, axis=0), axis=0)
 
+        wavenumber_2d = None
+        psd_2d = None
+        n_cols_2d = None
+
+        if cross_track_integrated:
+            filled = _fill_nan_2d(patch_2d, max_nan_fraction=max_nan_fraction_2d)
+
+            if filled is not None:
+                if remove_plane_2d:
+                    filled = _plane_detrend_2d(filled)
+
+                wavenumber_2d, psd_2d = _periodogram_2d_cross_track_integrated(
+                    filled,
+                    dx1_km=along_track_spacing_km,
+                    dx2_km=dx2_km_resolved,
+                    window=window_2d,
+                )
+                n_cols_2d = filled.shape[1]
+            # else: patch had too many/too large NaN gaps for the 2-D
+            # estimator specifically -- psd_2d stays None for this
+            # segment, but the default 1-D `psd` above is unaffected.
+
         segments.append(SegmentSpectrum(
             swath=swath_name,
             segment_index=seg_idx,
@@ -570,7 +803,11 @@ def compute_swath_spectra(
             along_track_distance_end_km=seg_dist[-1].item(),
             valid_fraction=np.mean(valid_fracs) if valid_fracs else 0.0,
             gap_filled=any_gap_filled,
-            month=month
+            month=month,
+            wavenumber_2d=wavenumber_2d,
+            psd_2d=psd_2d,
+            n_cols_2d=n_cols_2d,
+            dx2_km_2d=dx2_km_resolved if cross_track_integrated else None,
         ))
 
     if segments:
@@ -580,6 +817,14 @@ def compute_swath_spectra(
         wavenumber = np.array([])
         mean_psd = np.array([])
 
+    segments_2d = [s for s in segments if s.psd_2d is not None]
+    if segments_2d:
+        wavenumber_2d_out = segments_2d[0].wavenumber_2d
+        mean_psd_2d = np.mean(np.stack([s.psd_2d for s in segments_2d], axis=0), axis=0)
+    else:
+        wavenumber_2d_out = np.array([]) if cross_track_integrated else None
+        mean_psd_2d = np.array([]) if cross_track_integrated else None
+
     return PassSpectrumResult(
         swath=swath_name,
         wavenumber=wavenumber,
@@ -587,6 +832,9 @@ def compute_swath_spectra(
         n_segments_used=len(segments),
         n_segments_total=len(bounds),
         segments=segments,
+        wavenumber_2d=wavenumber_2d_out,
+        mean_psd_2d=mean_psd_2d,
+        n_segments_used_2d=len(segments_2d),
         month=month,
     )
 
@@ -604,14 +852,26 @@ def compute_pass_spectra(
     detrend: str = "linear",
     window: str = "hann",
     min_pixels_per_segment: int = 3,
-    
+    cross_track_integrated: bool = False,
+    dx2_km: Optional[float] = None,
+    max_nan_fraction_2d: float = 0.15,
+    remove_plane_2d: bool = True,
+    window_2d: str = "hann",
 ):
     """
     Compute along-track wavenumber
     spectra for BOTH swaths (left and right) of a SWOT L2 LR Basic pass,
     handling land/NaN gaps and the nadir gap automatically.
 
-    Parameters mirror compute_swath_spectra().
+    Parameters mirror compute_swath_spectra(). In particular,
+    cross_track_integrated=True additionally computes, per swath, a 2-D
+    (along-track x cross-track) cross-track-integrated PSD
+    (PassSpectrumResult.mean_psd_2d / .wavenumber_2d and each segment's
+    .psd_2d), directly comparable to the native-resolution "total" PSD
+    produced by swot_alias_spectra.py. It is off by default -- the
+    default return value is unchanged from the existing along-track-only
+    (per-column-averaged) computation.
+
     Returns
     -------
     dict with keys "left" and "right", each a PassSpectrumResult.
@@ -634,5 +894,11 @@ def compute_pass_spectra(
             detrend=detrend,
             window=window,
             min_pixels_per_segment=min_pixels_per_segment,
+            cross_track_integrated=cross_track_integrated,
+            cross_track_distance=cross_track_distance,
+            dx2_km=dx2_km,
+            max_nan_fraction_2d=max_nan_fraction_2d,
+            remove_plane_2d=remove_plane_2d,
+            window_2d=window_2d,
         )
     return results
