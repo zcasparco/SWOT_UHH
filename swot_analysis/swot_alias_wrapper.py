@@ -17,20 +17,20 @@ from swot_analysis.swot_alias_spectra import (
 # Default configuration (used only when this file is run as a script)
 # =============================================================================
 
-INPUT_FILE = Path(
-    "/path/to/SWOT_L2_LR_SSH_..._Unsmoothed.nc"
-)
+#INPUT_FILE = Path(
+#    "/path/to/SWOT_L2_LR_SSH_..._Unsmoothed.nc"
+#)
 
-OUTPUT_FILE = Path(
-    "/path/to/swot_alias_spectra.pkl"
-)
+#OUTPUT_FILE = Path(
+#    "/path/to/swot_alias_spectra.pkl"
+#)
 
 
 # -----------------------------------------------------------------------------
 # Segment configuration
 # -----------------------------------------------------------------------------
 
-SEGMENT_LENGTH_KM = 200.0
+SEGMENT_LENGTH_KM = 250.0
 OVERLAP = 0.0
 
 MAX_NAN_FRACTION = 0.15
@@ -38,7 +38,8 @@ MAX_GAP_FRACTION = 0.1
 
 N_TAPS = 9
 
-REMOVE_PLANE = True
+REMOVE_PLANE = True#
+
 
 REMOVE_EDGES_KM = None
 
@@ -50,7 +51,7 @@ REMOVE_EDGES_KM = None
 # -----------------------------------------------------------------------------
 
 DX1_NATIVE_KM = 0.25
-DX2_NATIVE_KM = 0.25
+DX2_NATIVE_KM = 0.25#
 
 DX1_EXPERT_KM = 2.0
 DX2_EXPERT_KM = 2.0
@@ -60,11 +61,11 @@ DX2_EXPERT_KM = 2.0
 # Optional geographic selection
 # -----------------------------------------------------------------------------
 
-LAT_MIN = -90.0
-LAT_MAX = 90.0
+LAT_MIN = -70.0
+LAT_MAX = 70.0
 
-LON_MIN = -180.0
-LON_MAX = 180.0
+LON_MIN = 0.0
+LON_MAX = 360.0
 
 
 # =============================================================================
@@ -82,6 +83,7 @@ def process_one_file(
     overlap: float = OVERLAP,
     max_nan_fraction: float = MAX_NAN_FRACTION,
     max_gap_fraction: float = MAX_GAP_FRACTION,
+    max_gap_km=None,
     n_taps: int = N_TAPS,
     dx1_native_km: float = DX1_NATIVE_KM,
     dx2_native_km: float = DX2_NATIVE_KM,
@@ -173,6 +175,7 @@ def process_one_file(
 
         max_nan_fraction=max_nan_fraction,
         max_gap_fraction=max_gap_fraction,
+        max_gap_km=max_gap_km,
 
         n_taps=n_taps,
 
@@ -254,6 +257,7 @@ def process_one_file(
                 "n_taps": n_taps,
                 "max_nan_fraction": max_nan_fraction,
                 "max_gap_fraction": max_gap_fraction,
+                "max_gap_km": max_gap_km,
                 "remove_plane": remove_plane,
             },
         }

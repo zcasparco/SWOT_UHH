@@ -116,6 +116,57 @@ def _interp_nan_1d(x: np.ndarray) -> np.ndarray:
     return x
 
 
+def _interp_nan_lon_1d(lon: np.ndarray) -> np.ndarray:
+    """
+    Same purpose as `_interp_nan_1d`, but wrap-safe for longitude.
+
+    Longitude is circular (SWOT products use the 0-360 convention, so a
+    pass crossing the prime meridian goes ...359.8, 359.9, 0.0, 0.1...).
+    Plain `np.interp` on the raw values has no notion of that wrap: if a
+    NaN in the reference track happens to fall exactly at a 0/360
+    crossing, it interpolates the "long way around" through ~180 degrees
+    instead of the true, short step through 0/360 -- injecting a large,
+    spurious position error into the along-track distance axis exactly
+    at the crossing. Interpolating the (cos, sin) unit-circle
+    representation instead sidesteps the wrap entirely.
+    """
+    lon = np.asarray(lon, dtype=float)
+    n = len(lon)
+    idx = np.arange(n)
+    good = np.isfinite(lon)
+    if good.sum() == 0 or good.sum() == n:
+        return lon.copy()
+
+    rad = np.radians(lon[good])
+    c = np.interp(idx, idx[good], np.cos(rad))
+    s = np.interp(idx, idx[good], np.sin(rad))
+
+    filled = lon.copy()
+    filled[~good] = np.degrees(np.arctan2(s[~good], c[~good])) % 360.0
+    return filled
+
+
+def _circular_mean_lon_deg(lon: np.ndarray) -> float:
+    """
+    Mean longitude, correctly handling the 0/360 wrap (average of unit
+    vectors, i.e. circular mean) instead of a plain arithmetic mean.
+    `np.nanmean([359.8, 0.2])` gives 180.0 -- exactly wrong, since the
+    true midpoint is ~0.0/360.0. Any segment whose along-track pixels
+    straddle the prime meridian gets a wildly wrong lon_mean under the
+    naive mean: it vanishes from its true location (0 deg) in anything
+    plotted/binned by lon_mean, and (if enough segments are affected)
+    reappears clustered near 180 deg instead -- which is exactly the
+    "discontinuity at 0 deg" symptom.
+    """
+    lon = np.asarray(lon, dtype=float)
+    valid = lon[np.isfinite(lon)]
+    if valid.size == 0:
+        return float("nan")
+    rad = np.radians(valid)
+    mean_angle = np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
+    return float(np.degrees(mean_angle) % 360.0)
+
+
 def _haversine_km(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(
         np.radians, (lat1, lon1, lat2, lon2)
@@ -175,7 +226,7 @@ def along_track_distance_km(
             lon = longitude[:, ref_col]
 
     lat = _interp_nan_1d(lat)
-    lon = _interp_nan_1d(lon)
+    lon = _interp_nan_lon_1d(lon)
 
     d = np.zeros(len(lat))
 
@@ -423,6 +474,53 @@ def _max_contiguous_gap_fraction(
         run[i] = (run[i - 1] + b[i]) * b[i]
 
     return float(run.max()) / n
+
+
+def _max_contiguous_gap_rows(
+    patch: np.ndarray,
+    axis: int = 0,
+    row_bad_threshold: float = 0.5,
+) -> int:
+    """
+    Same "mostly-missing run" logic as `_max_contiguous_gap_fraction`, but
+    returns the raw run length in rows rather than a fraction of the
+    segment length. Used together with `max_gap_km` so the contiguous-gap
+    check can be expressed in absolute along-track distance rather than
+    scaled by segment length -- important because a contiguous void
+    (an island, a coastline) has a fixed physical size that has nothing
+    to do with how long the analysis segment happens to be. With a long
+    segment_length_km (e.g. for finer wavenumber resolution) and only the
+    fraction-based check, a single island can cost you the *entire*
+    segment -- including hundreds of km of good ocean data on either
+    side of it -- purely because the segment window is long. An absolute
+    max_gap_km avoids that: the segment is only dropped when the actual
+    void is physically large, regardless of segment_length_km.
+    """
+
+    mask = np.isnan(patch)
+
+    if axis == 1:
+        mask = mask.T
+
+    n, width = mask.shape
+
+    if n == 0 or width == 0:
+        return 0
+
+    row_nan_fraction = mask.mean(axis=1)
+    row_bad = row_nan_fraction > row_bad_threshold
+
+    if not row_bad.any():
+        return 0
+
+    b = row_bad.astype(np.int64)
+    run = np.empty_like(b)
+    run[0] = b[0]
+
+    for i in range(1, n):
+        run[i] = (run[i - 1] + b[i]) * b[i]
+
+    return int(run.max())
 
 
 def _fill_nan_2d(
@@ -741,6 +839,7 @@ def compute_alias_swath_spectra(
     overlap: float = 0.0,
     max_nan_fraction: float = 0.15,
     max_gap_fraction: float = 0.1,
+    max_gap_km: Optional[float] = None,
     n_taps: int = 9,
     remove_plane: bool = True,
     center_latitudes: Optional[Sequence[float]] = None,
@@ -774,8 +873,23 @@ def compute_alias_swath_spectra(
       a straight line across a real physical gap -- damping genuine
       small-scale variance there and biasing exactly the along-track
       wavenumber spectrum this function is trying to estimate.
+    - `max_gap_km` (optional): the same contiguous-gap check, but as an
+      absolute along-track distance instead of a fraction of the
+      segment. Because a real void (an island, a coastline) has a fixed
+      physical size, using only a *fraction*-based threshold means the
+      absolute tolerance grows with `segment_length_km` -- with a long
+      segment (e.g. 1000 km for finer low-wavenumber resolution) and
+      `max_gap_fraction=0.1`, a single island wider than 100 km along
+      track gets the *entire* 1000 km segment dropped, discarding
+      hundreds of km of perfectly good ocean data on either side of it
+      purely because the analysis window was long. Set `max_gap_km` to
+      whatever absolute void size you actually want to tolerate (e.g.
+      50 km) and a segment is dropped only when the real physical gap
+      exceeds that, independent of `segment_length_km`. If both
+      `max_gap_fraction` and `max_gap_km` are set, a segment must pass
+      both (the smaller effective tolerance wins).
 
-    Only segments passing *both* checks reach `_fill_nan_2d`, so the
+    Only segments passing *both/all* checks reach `_fill_nan_2d`, so the
     linear interpolation it performs is only ever applied to short,
     scattered gaps (typical KaRIn per-pixel dropouts) -- the case it's
     actually a reasonable approximation for.
@@ -859,6 +973,14 @@ def compute_alias_swath_spectra(
             n_dropped_gap += 1
             continue
 
+        if max_gap_km is not None:
+            gap_rows = _max_contiguous_gap_rows(patch, axis=0)
+            gap_km = gap_rows * dx1_native_km
+
+            if gap_km > max_gap_km:
+                n_dropped_gap += 1
+                continue
+
         filled = _fill_nan_2d(
             patch,
             max_nan_fraction=max_nan_fraction,
@@ -894,7 +1016,7 @@ def compute_alias_swath_spectra(
         lat_mean = float(np.nanmean(lat_chunk))
         lat_min = float(np.nanmin(lat_chunk))
         lat_max = float(np.nanmax(lat_chunk))
-        lon_mean = float(np.nanmean(lon_chunk))
+        lon_mean = _circular_mean_lon_deg(lon_chunk)
 
         segments.append(
             AliasSegmentSpectrum(
@@ -1030,6 +1152,7 @@ def compute_alias_pass_spectra(
     overlap: float = 0.0,
     max_nan_fraction: float = 0.15,
     max_gap_fraction: float = 0.1,
+    max_gap_km: Optional[float] = None,
     n_taps: int = 9,
     remove_plane: bool = True,
     remove_edges_km: Optional[float] = None,
@@ -1083,6 +1206,7 @@ def compute_alias_pass_spectra(
             overlap=overlap,
             max_nan_fraction=max_nan_fraction,
             max_gap_fraction=max_gap_fraction,
+            max_gap_km=max_gap_km,
             n_taps=n_taps,
 
             remove_plane=remove_plane,
@@ -1104,6 +1228,19 @@ def load_swot_l2_unsmoothed(
 ):
     """
     Load SWOT L2 LR Unsmoothed data from the left/right groups.
+
+    Correction handling
+    --------------------
+    ``height_cor_xover`` and ``internal_tide_hret`` are added with a
+    missing value treated as "no correction available" (0.0) rather than
+    being allowed to propagate as NaN into ``ssha``. ``internal_tide_hret``
+    in particular is only populated in specific internal-tide generation
+    regions, not globally -- previously, a NaN there silently nulled out
+    an otherwise good ``ssha_karin_2`` value, producing large, sharply-
+    bounded "gaps" that track the tide model's coverage rather than any
+    real land/rain/instrument dropout. Only ``ssha_karin_2`` itself (and
+    the quality/surface-type flags applied below) can now introduce NaN
+    into the output.
     """
 
     if xr is None:
@@ -1118,17 +1255,40 @@ def load_swot_l2_unsmoothed(
             group=group_name,
         )
 
+        # NOTE: corrections are added with missing values treated as
+        # "no correction available" (0.0), NOT propagated as NaN. Both
+        # height_cor_xover and, especially, internal_tide_hret can be
+        # NaN over large stretches of ocean where the correction simply
+        # isn't defined (internal-tide models in particular are only
+        # populated in specific generation regions, not globally) --
+        # if that NaN is allowed to propagate through the sum, an
+        # otherwise perfectly good ssha_karin_2 value gets nulled out
+        # for a reason that has nothing to do with the SSH measurement
+        # itself. That produces exactly the kind of "unphysical" gaps
+        # (large regions, following a correction model's coverage
+        # rather than any real land/rain/instrument dropout) that this
+        # fix addresses. A per-pixel flag is kept so downstream code can
+        # still identify/exclude uncorrected pixels if desired.
+        base = ds[ssh_var].values.astype(float)
+
+        xover = ds["height_cor_xover"].values.astype(float)
+        xover_missing = ~np.isfinite(xover)
+        xover = np.where(xover_missing, 0.0, xover)
+
+        ssha = base + xover
+        tide_missing = np.zeros_like(base, dtype=bool)
+
         if HRET:
-            ssha = (
-                ds[ssh_var]
-                + ds["height_cor_xover"]
-                + ds["internal_tide_hret"]
-            ).values
-        else:
-            ssha = (
-                ds[ssh_var]
-                + ds["height_cor_xover"]
-            ).values
+            hret = ds["internal_tide_hret"].values.astype(float)
+            tide_missing = ~np.isfinite(hret)
+            hret = np.where(tide_missing, 0.0, hret)
+
+            ssha = ssha + hret
+
+        # Only the SSH measurement itself (and any quality/surface-type
+        # flags below) should be able to introduce NaN from here on --
+        # not a missing correction.
+        ssha = np.where(np.isfinite(base), ssha, np.nan)
 
         for q in (
             f"{ssh_var}_qual",
