@@ -289,9 +289,11 @@ def along_track_distance_km(lat: np.ndarray, lon: np.ndarray,
             ref_lon = lon[:, ref_col]
 
     # interpolate over any internal NaNs in the reference track so the
-    # distance axis itself is always well defined
+    # distance axis itself is always well defined. Longitude uses a
+    # wrap-safe fill (see _interp_nan_lon_1d) since SWOT longitudes are
+    # 0-360 and a NaN can coincide with a prime-meridian crossing.
     ref_lat = _interp_nan_1d(ref_lat)
-    ref_lon = _interp_nan_1d(ref_lon)
+    ref_lon = _interp_nan_lon_1d(ref_lon)
 
     d = np.zeros_like(ref_lat)
     d[1:] = _haversine_km(ref_lat[:-1], ref_lon[:-1], ref_lat[1:], ref_lon[1:])
@@ -310,6 +312,57 @@ def _interp_nan_1d(x: np.ndarray) -> np.ndarray:
     if good.sum() < n:
         x[~good] = np.interp(idx[~good], idx[good], x[good])
     return x
+
+
+def _interp_nan_lon_1d(lon: np.ndarray) -> np.ndarray:
+    """
+    Same purpose as `_interp_nan_1d`, but wrap-safe for longitude.
+
+    Longitude is circular (SWOT products use the 0-360 convention, so a
+    swath crossing the prime meridian goes ...359.8, 359.9, 0.0, 0.1...).
+    Plain `np.interp` on the raw values has no notion of that wrap: if a
+    NaN happens to fall exactly at a 0/360 crossing, it interpolates the
+    "long way around" through ~180 degrees instead of the true, short
+    step through 0/360 -- injecting a large, spurious position error
+    exactly at the crossing. Interpolating the (cos, sin) unit-circle
+    representation instead sidesteps the wrap entirely (and works
+    whether the input happens to use the 0-360 or -180-180 convention).
+    """
+    lon = np.asarray(lon, dtype=float)
+    n = len(lon)
+    idx = np.arange(n)
+    good = ~np.isnan(lon)
+    if good.sum() == 0 or good.sum() == n:
+        return lon.copy()
+
+    rad = np.radians(lon[good])
+    c = np.interp(idx, idx[good], np.cos(rad))
+    s = np.interp(idx, idx[good], np.sin(rad))
+
+    filled = lon.copy()
+    filled[~good] = np.degrees(np.arctan2(s[~good], c[~good])) % 360.0
+    return filled
+
+
+def _circular_mean_lon_deg(lon: np.ndarray) -> float:
+    """
+    Mean longitude, correctly handling the 0/360 wrap (average of unit
+    vectors, i.e. circular mean) instead of a plain arithmetic mean.
+    `np.nanmean([359.8, 0.2])` gives 180.0 -- exactly wrong, since the
+    true midpoint is ~0.0/360.0. Any segment whose along-track pixels
+    straddle the prime meridian gets a wildly wrong lon_mean under the
+    naive mean, which is very likely what you're seeing as a "hole" at
+    0 deg (those segments effectively vanish from their true location in
+    anything binned/plotted by lon_mean) with data seemingly displaced
+    elsewhere.
+    """
+    lon = np.asarray(lon, dtype=float)
+    valid = lon[~np.isnan(lon)]
+    if valid.size == 0:
+        return float("nan")
+    rad = np.radians(valid)
+    mean_angle = np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
+    return float(np.degrees(mean_angle) % 360.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -798,7 +851,7 @@ def compute_swath_spectra(
             lat_mean=np.nanmean(seg_lat).item(),
             lat_min=np.nanmin(seg_lat).item(),
             lat_max=np.nanmax(seg_lat).item(),
-            lon_mean=np.nanmean(seg_lon).item(),
+            lon_mean=_circular_mean_lon_deg(seg_lon),
             along_track_distance_start_km=seg_dist[0].item(),
             along_track_distance_end_km=seg_dist[-1].item(),
             valid_fraction=np.mean(valid_fracs) if valid_fracs else 0.0,
