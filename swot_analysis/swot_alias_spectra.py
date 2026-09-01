@@ -96,6 +96,76 @@ class AliasPassSpectrumResult:
 
     def segment_longitudes(self) -> np.ndarray:
         return np.array([s.lon_mean for s in self.segments])
+        
+@dataclasses.dataclass
+class AliasSegmentFullSpectrum:
+    """
+    Alias-decomposition result for one along-track/cross-track Unsmoothed
+    SWOT segment.
+
+    All PSDs use the same along-track wavenumber axis and have units of
+    SSH^2 / (cycles/km).
+
+    total_psd = direct_psd + aliased_psd
+    """
+
+    swath: str
+    segment_index: int
+
+    wavenumber: np.ndarray
+
+    direct_psd: np.ndarray
+    native_psd: np.ndarray
+
+    lat_mean: float
+    lat_min: float
+    lat_max: float
+    lon_mean: float
+
+    along_track_distance_start_km: float
+    along_track_distance_end_km: float
+
+    n_lines: int
+    n_pixels: int
+
+    valid_fraction: float
+    gap_filled: bool
+
+    # Useful diagnostics
+    direct_energy: Optional[float] = None
+    aliased_energy: Optional[float] = None
+    aliased_fraction: Optional[float] = None
+    gap_fraction: Optional[float] = None
+
+@dataclasses.dataclass
+
+class AliasPassFullSpectrumResult:
+    """All alias-decomposition segments for one SWOT swath."""
+
+    swath: str
+
+    wavenumber: np.ndarray
+
+    mean_direct_psd: np.ndarray
+    mean_native_psd: np.ndarray
+
+    segments: list[AliasSegmentSpectrum]
+
+    n_segments_used: int
+    n_segments_total: int
+
+    month: Optional[int] = None
+
+    # Diagnostics: how many candidate segments were dropped, and why.
+    # Populated by compute_alias_swath_spectra; useful for sanity-checking
+    # NaN/gap handling across a large batch of files without having to
+    # inspect every segment.
+
+    def segment_latitudes(self) -> np.ndarray:
+        return np.array([s.lat_mean for s in self.segments])
+
+    def segment_longitudes(self) -> np.ndarray:
+        return np.array([s.lon_mean for s in self.segments])
 
 
 # ============================================================================
@@ -689,6 +759,7 @@ def alias_decompose_patch(
     dx1_expert_km: float,
     dx2_expert_km: float,
     n_taps: int = 9,
+    full_direct: bool = False,
 ):
     """
     Compute direct and aliased Expert-resolution along-track spectra.
@@ -770,9 +841,10 @@ def alias_decompose_patch(
         n2e,
     ).sum(axis=1)
 
+    
     # r=0, s=0 = direct contribution.
     direct_2d = S_filtered[:n1e, :n2e]
-
+    
     # ---------------------------------------------------------------
     # Integrate cross-track wavenumber.
     # ---------------------------------------------------------------
@@ -781,7 +853,8 @@ def alias_decompose_patch(
 
     total_1d = folded.sum(axis=1) * dk2
     direct_1d = direct_2d.sum(axis=1) * dk2
-
+    
+    
     aliased_1d = np.maximum(
         total_1d - direct_1d,
         0.0,
@@ -801,6 +874,7 @@ def alias_decompose_patch(
     k = k_expert[positive]
 
     direct = direct_1d[positive].copy()
+    
     total = total_1d[positive].copy()
 
     # DC and Nyquist are not doubled.
@@ -816,8 +890,26 @@ def alias_decompose_patch(
         total - direct,
         0.0,
     )
-
-    return k, direct, aliased, total
+    if full_direct:
+        positive_full = k1 >=0
+        kfull = k1[positive_full]
+        interior_full = (
+        (kfull > 0)
+        & (kfull < np.max(np.abs(k1)))
+    )
+        direct_2d_full = S_filtered
+        
+        direct_1d_full = direct_2d_full.sum(axis=1) * dk2
+        native_1d_full = S_native.sum(axis=1) * dk2
+        
+        direct_full = direct_1d_full[positive_full].copy()
+        direct_full[interior_full] *= 2.0
+        native_full = native_1d_full[positive_full].copy()
+        native_full[interior_full] *= 2.0
+        
+        return k, direct, aliased, total, kfull, direct_full, native_full
+    else:
+        return k, direct, aliased, total
 
 
 # ============================================================================
@@ -842,6 +934,7 @@ def compute_alias_swath_spectra(
     max_gap_km: Optional[float] = None,
     n_taps: int = 9,
     remove_plane: bool = True,
+    full_direct: bool = False,
     center_latitudes: Optional[Sequence[float]] = None,
 ):
     """
@@ -944,7 +1037,8 @@ def compute_alias_swath_spectra(
         )
 
     segments = []
-
+    segments_full = []
+    
     n_dropped_nan_fraction = 0
     n_dropped_gap = 0
     n_dropped_fill_failed = 0
@@ -1002,13 +1096,16 @@ def compute_alias_swath_spectra(
             dx1_expert_km,
             dx2_expert_km,
             n_taps=n_taps,
+            full_direct=full_direct,
         )
 
         if result is None:
             n_dropped_decompose_failed += 1
             continue
-
-        k, direct, aliased, total = result
+        if full_direct:
+            k, direct, aliased, total, kfull, direct_full, native = result
+        else:
+            k, direct, aliased, total = result
 
         lat_chunk = sub_lat[i0:i1]
         lon_chunk = sub_lon[i0:i1]
@@ -1049,6 +1146,37 @@ def compute_alias_swath_spectra(
                 gap_fraction=gap_fraction,
             )
         )
+        if full_direct:
+            segments_full.append(
+                AliasSegmentFullSpectrum(
+                    swath=swath_name,
+                    segment_index=segment_index,
+    
+                    wavenumber=kfull,
+    
+                    direct_psd=direct_full,
+                    native_psd=native,
+    
+                    lat_mean=lat_mean,
+                    lat_min=lat_min,
+                    lat_max=lat_max,
+                    lon_mean=lon_mean,
+    
+                    along_track_distance_start_km=float(
+                        distance[i0]
+                    ),
+                    along_track_distance_end_km=float(
+                        distance[i1 - 1]
+                    ),
+    
+                    n_lines=i1 - i0,
+                    n_pixels=filled.shape[1],
+    
+                    valid_fraction=valid_fraction,
+                    gap_filled=gap_filled,
+                    gap_fraction=gap_fraction,
+                )
+            )
 
     # Defensive check: with fixed-sample segmentation every segment should
     # already share the same wavenumber-axis length (== n1e_target). This
@@ -1099,6 +1227,46 @@ def compute_alias_swath_spectra(
             n_segments_dropped_fill_failed=n_dropped_fill_failed,
             n_segments_dropped_decompose_failed=n_dropped_decompose_failed,
         )
+    
+    if segments_full:
+
+        lengths_full = {len(s.wavenumber) for s in segments_full}
+
+        if len(lengths) > 1:
+
+            counts = {
+                length: sum(1 for s in segments_full if len(s.wavenumber) == length)
+                for length in lengths_full
+            }
+
+            majority_length = max(counts, key=counts.get)
+
+            warnings.warn(
+                f"[{swath_name}] Segments with inconsistent wavenumber "
+                f"lengths {sorted(lengths)} were produced (expected a "
+                f"single length of {n1e_target}); keeping only the "
+                f"{counts[majority_length]} segments of length "
+                f"{majority_length} and dropping the rest. This should "
+                "not normally happen -- please report it.",
+                RuntimeWarning,
+            )
+
+            segments_full = [
+                s for s in segments_full if len(s.wavenumber) == majority_length
+            ]
+
+    if full_direct and not segments_full:
+
+        return AliasPassFullSpectrumResult(
+            swath=swath_name,
+            wavenumber=np.array([]),
+            mean_direct_psd=np.array([]),
+            mean_native_psd=np.array([]),
+            segments=[],
+            n_segments_used=0,
+            n_segments_total=len(bounds),
+            month=month,
+        )
 
     k = segments[0].wavenumber
 
@@ -1113,8 +1281,19 @@ def compute_alias_swath_spectra(
     )
 
     total = direct + aliased
-
-    return AliasPassSpectrumResult(
+    if full_direct:
+        kfull = segments_full[0].wavenumber
+    
+        direct_full = np.mean(
+            np.stack([s.direct_psd for s in segments_full]),
+            axis=0,
+        )
+    
+        native = np.mean(
+            np.stack([s.native_psd for s in segments_full]),
+            axis=0,
+        )
+        return AliasPassSpectrumResult(
         swath=swath_name,
 
         wavenumber=k,
@@ -1134,7 +1313,39 @@ def compute_alias_swath_spectra(
         n_segments_dropped_gap=n_dropped_gap,
         n_segments_dropped_fill_failed=n_dropped_fill_failed,
         n_segments_dropped_decompose_failed=n_dropped_decompose_failed,
-    )
+    ), AliasPassFullSpectrumResult(
+            swath=swath_name,
+            wavenumber=kfull,
+            mean_direct_psd=direct_full,
+            mean_native_psd=native,
+            segments=segments_full,
+            n_segments_used=len(segments_full),
+            n_segments_total=len(bounds),
+            month=month,
+        )
+        
+    else:
+        return AliasPassSpectrumResult(
+            swath=swath_name,
+    
+            wavenumber=k,
+    
+            mean_direct_psd=direct,
+            mean_aliased_psd=aliased,
+            mean_total_psd=total,
+    
+            segments=segments,
+    
+            n_segments_used=len(segments),
+            n_segments_total=len(bounds),
+    
+            month=month,
+    
+            n_segments_dropped_nan_fraction=n_dropped_nan_fraction,
+            n_segments_dropped_gap=n_dropped_gap,
+            n_segments_dropped_fill_failed=n_dropped_fill_failed,
+            n_segments_dropped_decompose_failed=n_dropped_decompose_failed,
+        )
 
 
 # ============================================================================
@@ -1155,6 +1366,7 @@ def compute_alias_pass_spectra(
     max_gap_km: Optional[float] = None,
     n_taps: int = 9,
     remove_plane: bool = True,
+    full_direct: bool = False,
     remove_edges_km: Optional[float] = None,
     center_latitudes: Optional[dict] = None,
 ):
@@ -1176,7 +1388,7 @@ def compute_alias_pass_spectra(
     )
 
     results = {}
-
+    results_full = {}
     for swath, mask in (
         ("left", left_mask),
         ("right", right_mask),
@@ -1187,8 +1399,8 @@ def compute_alias_pass_spectra(
             if center_latitudes is not None
             else None
         )
-
-        results[swath] = compute_alias_swath_spectra(
+        if full_direct:
+            results[swath], results_full[swath] = compute_alias_swath_spectra(
             ssha=data["ssha"],
             latitude=data["latitude"],
             longitude=data["longitude"],
@@ -1212,9 +1424,41 @@ def compute_alias_pass_spectra(
             remove_plane=remove_plane,
 
             center_latitudes=targets,
+            
+            full_direct=full_direct,
         )
-
-    return results
+        else:
+            results[swath] = compute_alias_swath_spectra(
+                ssha=data["ssha"],
+                latitude=data["latitude"],
+                longitude=data["longitude"],
+                swath_mask=mask,
+                swath_name=swath,
+    
+                segment_length_km=segment_length_km,
+    
+                dx1_native_km=dx1_native_km,
+                dx2_native_km=dx2_native_km,
+                dx1_expert_km=dx1_expert_km,
+                dx2_expert_km=dx2_expert_km,
+    
+                month=month,
+                overlap=overlap,
+                max_nan_fraction=max_nan_fraction,
+                max_gap_fraction=max_gap_fraction,
+                max_gap_km=max_gap_km,
+                n_taps=n_taps,
+    
+                remove_plane=remove_plane,
+    
+                center_latitudes=targets,
+                
+                full_direct=full_direct,
+            )
+    if full_direct:
+        return results, results_full
+    else:
+        return results
 
 
 # ============================================================================
@@ -1224,7 +1468,7 @@ def compute_alias_pass_spectra(
 def load_swot_l2_unsmoothed(
     filepath,
     ssh_var="ssha_karin_2",
-    HRET=True,
+    HRET=False,
 ):
     """
     Load SWOT L2 LR Unsmoothed data from the left/right groups.
@@ -1494,6 +1738,128 @@ def segments_to_dataset(
             total_psd=(
                 ["segment", "wavenumber"],
                 total_psd,
+                {
+                    "long_name": "Total (direct + aliased) along-track SSHA PSD",
+                    "units": "m^2 / (cycles/km)",
+                },
+            ),
+            lat_mean=(
+                ["segment"],
+                [s.lat_mean for s in segments],
+                {"units": "degrees_north"},
+            ),
+            lat_min=(
+                ["segment"],
+                [s.lat_min for s in segments],
+                {"units": "degrees_north"},
+            ),
+            lat_max=(
+                ["segment"],
+                [s.lat_max for s in segments],
+                {"units": "degrees_north"},
+            ),
+            lon_mean=(
+                ["segment"],
+                [s.lon_mean for s in segments],
+                {"units": "degrees_east"},
+            ),
+            along_track_distance_start_km=(
+                ["segment"],
+                [s.along_track_distance_start_km for s in segments],
+                {"units": "km"},
+            ),
+            along_track_distance_end_km=(
+                ["segment"],
+                [s.along_track_distance_end_km for s in segments],
+                {"units": "km"},
+            ),
+            n_lines=(["segment"], [s.n_lines for s in segments]),
+            n_pixels=(["segment"], [s.n_pixels for s in segments]),
+            valid_fraction=(["segment"], [s.valid_fraction for s in segments]),
+            gap_filled=(["segment"], [bool(s.gap_filled) for s in segments]),
+            gap_fraction=(
+                ["segment"],
+                [
+                    s.gap_fraction if s.gap_fraction is not None else np.nan
+                    for s in segments
+                ],
+                {
+                    "long_name": "Longest contiguous along-track NaN run, "
+                                  "as a fraction of the segment length",
+                },
+            ),
+            swath=(["segment"], [s.swath for s in segments]),
+            segment_index=(["segment"], [s.segment_index for s in segments]),
+        ),
+        coords=dict(
+            wavenumber=("wavenumber", wavenumber, {"units": "cycles/km"}),
+            segment=("segment", np.arange(len(segments))),
+        ),
+    )
+
+
+def full_segments_to_dataset(
+    segments: Sequence[AliasSegmentFullSpectrum],
+) -> "xr.Dataset":
+    """
+    Pack a flat list of AliasSegmentSpectrum objects (e.g. from
+    `flatten_alias_segments`) into a single xarray.Dataset with dimensions
+    ("segment", "wavenumber").
+
+    Every segment must share the same wavenumber-axis length. With
+    `compute_alias_pass_spectra` / `compute_alias_swath_spectra` this is
+    guaranteed for every segment produced with the same
+    (segment_length_km, dx1_native_km, dx1_expert_km) -- including
+    segments from different swaths and different files -- so results from
+    many granules can be concatenated directly with this function (e.g.
+    `xr.concat([segments_to_dataset(f) for f in per_file_segments],
+    dim="segment")`, or simply passing the combined segment list from all
+    files at once, as done here).
+
+    Raises
+    ------
+    ValueError
+        If the segments do not all share the same wavenumber-axis length
+        (this would mean they came from calls with different
+        segment_length_km / dx1_native_km / dx1_expert_km).
+    """
+
+    if xr is None:
+        raise ImportError(
+            "xarray is required for segments_to_dataset()."
+        )
+
+    if not segments:
+        raise ValueError("No segments to pack.")
+
+    lengths = {len(s.wavenumber) for s in segments}
+
+    if len(lengths) > 1:
+        raise ValueError(
+            f"Segments have inconsistent wavenumber-axis lengths "
+            f"{sorted(lengths)}; they must all come from calls with "
+            "identical segment_length_km, dx1_native_km and "
+            "dx1_expert_km."
+        )
+
+    wavenumber = segments[0].wavenumber
+
+    direct_psd = np.stack([s.direct_psd for s in segments], axis=0)
+    native_psd = np.stack([s.native_psd for s in segments], axis=0)
+
+    return xr.Dataset(
+        data_vars=dict(
+            direct_psd=(
+                ["segment", "wavenumber"],
+                direct_psd,
+                {
+                    "long_name": "Direct (unaliased) along-track SSHA PSD",
+                    "units": "m^2 / (cycles/km)",
+                },
+            ),
+            native_psd=(
+                ["segment", "wavenumber"],
+                native_psd,
                 {
                     "long_name": "Total (direct + aliased) along-track SSHA PSD",
                     "units": "m^2 / (cycles/km)",

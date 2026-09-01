@@ -99,6 +99,7 @@ def process_one_file(
     ssh_var: str = "ssha_karin_2",
     verbose: bool = False,
     return_counts: bool = False,
+    full_direct: bool = False,
     # Accepted for backwards compatibility with older notebook cells; not
     # currently used by the alias-decomposition itself.
     max_patches=None,
@@ -159,62 +160,105 @@ def process_one_file(
         ssh_var=ssh_var,
         HRET=hret,
     )
-
-    by_swath = compute_alias_pass_spectra(
-        data=data,
-
-        segment_length_km=segment_length_km,
-
-        dx1_native_km=dx1_native_km,
-        dx2_native_km=dx2_native_km,
-
-        dx1_expert_km=dx1_expert_km,
-        dx2_expert_km=dx2_expert_km,
-
-        overlap=overlap,
-
-        max_nan_fraction=max_nan_fraction,
-        max_gap_fraction=max_gap_fraction,
-        max_gap_km=max_gap_km,
-
-        n_taps=n_taps,
-
-        remove_plane=remove_plane,
-
-        remove_edges_km=remove_edges_km,
-    )
-
-    all_segments = flatten_alias_segments(
-        by_swath,
-
-        lat_min=lat_min,
-        lat_max=lat_max,
-
-        lon_min=lon_min,
-        lon_max=lon_max,
-    )
-
-    result = {
-        swath: by_swath[swath].segments
-        for swath in ("left", "right")
-    }
+    if full_direct:
+        by_swath, by_swath_full = compute_alias_pass_spectra(
+            data=data,
+    
+            segment_length_km=segment_length_km,
+    
+            dx1_native_km=dx1_native_km,
+            dx2_native_km=dx2_native_km,
+    
+            dx1_expert_km=dx1_expert_km,
+            dx2_expert_km=dx2_expert_km,
+    
+            overlap=overlap,
+    
+            max_nan_fraction=max_nan_fraction,
+            max_gap_fraction=max_gap_fraction,
+            max_gap_km=max_gap_km,
+    
+            n_taps=n_taps,
+    
+            remove_plane=remove_plane,
+    
+            remove_edges_km=remove_edges_km,
+    
+            full_direct=full_direct
+        )
+    
+        all_segments = flatten_alias_segments(
+            by_swath,
+    
+            lat_min=lat_min,
+            lat_max=lat_max,
+    
+            lon_min=lon_min,
+            lon_max=lon_max,
+        )
+        result = {
+            swath: by_swath[swath].segments
+            for swath in ("left", "right")
+        }
+        result_full = {
+            swath: by_swath_full[swath].segments
+            for swath in ("left", "right")
+        }
+    else:
+        by_swath = compute_alias_pass_spectra(
+            data=data,
+    
+            segment_length_km=segment_length_km,
+    
+            dx1_native_km=dx1_native_km,
+            dx2_native_km=dx2_native_km,
+    
+            dx1_expert_km=dx1_expert_km,
+            dx2_expert_km=dx2_expert_km,
+    
+            overlap=overlap,
+    
+            max_nan_fraction=max_nan_fraction,
+            max_gap_fraction=max_gap_fraction,
+            max_gap_km=max_gap_km,
+    
+            n_taps=n_taps,
+    
+            remove_plane=remove_plane,
+    
+            remove_edges_km=remove_edges_km,
+    
+            full_direct=full_direct
+        )
+        all_segments = flatten_alias_segments(
+            by_swath,
+    
+            lat_min=lat_min,
+            lat_max=lat_max,
+    
+            lon_min=lon_min,
+            lon_max=lon_max,
+        )
+        result = {
+            swath: by_swath[swath].segments
+            for swath in ("left", "right")
+        }
 
     # Segment counts/diagnostics per swath, mainly useful for QC across a
     # large batch of files: how many candidate segments were dropped, and
     # for which of the two independent NaN-related reasons (total fraction
     # vs. a large contiguous gap -- see compute_alias_swath_spectra).
     segment_counts = {
-        swath: {
-            "n_segments_total": by_swath[swath].n_segments_total,
-            "n_segments_used": by_swath[swath].n_segments_used,
-            "n_segments_dropped_nan_fraction": by_swath[swath].n_segments_dropped_nan_fraction,
-            "n_segments_dropped_gap": by_swath[swath].n_segments_dropped_gap,
-            "n_segments_dropped_fill_failed": by_swath[swath].n_segments_dropped_fill_failed,
-            "n_segments_dropped_decompose_failed": by_swath[swath].n_segments_dropped_decompose_failed,
+            swath: {
+                "n_segments_total": by_swath[swath].n_segments_total,
+                "n_segments_used": by_swath[swath].n_segments_used,
+                "n_segments_dropped_nan_fraction": by_swath[swath].n_segments_dropped_nan_fraction,
+                "n_segments_dropped_gap": by_swath[swath].n_segments_dropped_gap,
+                "n_segments_dropped_fill_failed": by_swath[swath].n_segments_dropped_fill_failed,
+                "n_segments_dropped_decompose_failed": by_swath[swath].n_segments_dropped_decompose_failed,
+            }
+            for swath in ("left", "right")
         }
-        for swath in ("left", "right")
-    }
-
     if verbose:
         for swath in ("left", "right"):
             c = segment_counts[swath]
@@ -267,8 +311,10 @@ def process_one_file(
 
     if return_counts:
         return result, segment_counts
-
-    return result
+    if full_direct:
+        return result, result_full
+    else:
+        return result
 
 
 # =============================================================================
