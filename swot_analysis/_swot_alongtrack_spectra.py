@@ -397,8 +397,7 @@ def split_left_right_swaths(cross_track_distance: np.ndarray):
 # --------------------------------------------------------------------------- #
 
 def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
-                     overlap: float = 0.0,
-                     center_distances_km: Optional[Sequence[float]] = None):
+                     overlap: float = 0.0):
     """Yield (i_start, i_end) index pairs splitting `distance_km` into
     along-track segments of length `segment_length_km`, with optional
     fractional overlap (0 <= overlap < 1).
@@ -412,32 +411,23 @@ def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
     latitude for every file -- which shows up as a solid, uncovered
     latitude band once results are aggregated across many
     passes/granules, growing wider as segment_length_km increases.
-
-    center_distances_km : sequence of float, optional
-        If given, bypass the regular start/step/end-anchoring scheme
-        above entirely and instead place one segment of length
-        `segment_length_km` centered on each given along-track distance
-        (`overlap` is ignored in this mode).
     """
-    if center_distances_km is not None:
-        starts_km = [c - segment_length_km / 2.0 for c in center_distances_km]
+    if (0.0 <= overlap < 1.0):
+        step_km = segment_length_km * (1.0 - overlap)
     else:
-        if (0.0 <= overlap < 1.0):
-            step_km = segment_length_km * (1.0 - overlap)
-        else:
-            raise ValueError("overlap must be in [0, 1).")
-        total = distance_km[-1]
-        starts_km = list(np.arange(distance_km[0], total - segment_length_km + 1e-9, step_km))
-        if len(starts_km) == 0:
-            # pass shorter than one segment: use whole pass as a single segment
-            starts_km = [distance_km[0]]
+        raise ValueError("overlap must be in [0, 1).")
+    total = distance_km[-1]
+    starts_km = list(np.arange(distance_km[0], total - segment_length_km + 1e-9, step_km))
+    if len(starts_km) == 0:
+        # pass shorter than one segment: use whole pass as a single segment
+        starts_km = [distance_km[0]]
 
-        # Anchor one final segment to the literal end of the track, even if it
-        # overlaps the previous segment more than the nominal step -- this
-        # guarantees full start-to-end coverage regardless of segment_length_km.
-        last_start_needed = total - segment_length_km
-        if last_start_needed > starts_km[-1] + 1e-9:
-            starts_km.append(last_start_needed)
+    # Anchor one final segment to the literal end of the track, even if it
+    # overlaps the previous segment more than the nominal step -- this
+    # guarantees full start-to-end coverage regardless of segment_length_km.
+    last_start_needed = total - segment_length_km
+    if last_start_needed > starts_km[-1] + 1e-9:
+        starts_km.append(last_start_needed)
 
     bounds = []
     seen_i1 = set()
@@ -452,23 +442,6 @@ def _segment_bounds(distance_km: np.ndarray, segment_length_km: float,
         seen_i1.add(i1)
         bounds.append((i0, i1))
     return bounds
-
-
-def _center_latitudes_to_distances_km(lat_1d: np.ndarray, distance_km: np.ndarray,
-                                       center_latitudes: Sequence[float]) -> list:
-    """Map each target latitude to the along-track distance (km) of the
-    nearest sample in `lat_1d` (a representative per-line latitude, e.g.
-    the cross-track mean). Used to center segments on given latitudes
-    rather than on a regular along-track grid.
-    """
-    valid = np.isfinite(lat_1d)
-    lat_valid = lat_1d[valid]
-    dist_valid = distance_km[valid]
-    centers = []
-    for target_lat in center_latitudes:
-        idx = int(np.argmin(np.abs(lat_valid - target_lat)))
-        centers.append(float(dist_valid[idx]))
-    return centers
 
 
 # --------------------------------------------------------------------------- #
@@ -617,7 +590,6 @@ def compute_swath_spectra(
     max_nan_fraction_2d: float = 0.15,
     remove_plane_2d: bool = True,
     window_2d: str = "hann",
-    center_latitudes: Optional[Sequence[float]] = None,
 ) -> PassSpectrumResult:
     """
     Compute along-track wavenumber spectra for ONE swath (left or right)
@@ -698,12 +670,6 @@ def compute_swath_spectra(
     window_2d : str
         Taper window (both dimensions) for the 2-D periodogram. Only used
         when cross_track_integrated=True.
-    center_latitudes : sequence of float, optional
-        If given, segments are placed at fixed positions, one per entry,
-        each of length `segment_length_km` and centered on the along-track
-        sample whose latitude is closest to that entry, instead of the
-        default regularly-stepped (`overlap`-based) segmentation.
-        `overlap` is ignored when this is given.
 
     Returns
     -------
@@ -735,14 +701,7 @@ def compute_swath_spectra(
         diffs = diffs[diffs > 0]
         along_track_spacing_km = np.float64(np.median(diffs)) if diffs.size else 2.0
 
-    center_distances_km = None
-    if center_latitudes is not None:
-        lat_1d = np.nanmean(sub_lat, axis=1)
-        center_distances_km = _center_latitudes_to_distances_km(
-            lat_1d, distance_km, center_latitudes)
-
-    bounds = _segment_bounds(distance_km, segment_length_km, overlap=overlap,
-                              center_distances_km=center_distances_km)
+    bounds = _segment_bounds(distance_km, segment_length_km, overlap=overlap)
 
     # nperseg: convert segment length to sample count using the nominal
     # spacing, but in practice we just use the index range from
@@ -951,8 +910,6 @@ def compute_pass_spectra(
     max_nan_fraction_2d: float = 0.15,
     remove_plane_2d: bool = True,
     window_2d: str = "hann",
-    left_center_latitudes: Optional[Sequence[float]] = None,
-    right_center_latitudes: Optional[Sequence[float]] = None,
 ):
     """
     Compute along-track wavenumber
@@ -968,23 +925,11 @@ def compute_pass_spectra(
     default return value is unchanged from the existing along-track-only
     (per-column-averaged) computation.
 
-    left_center_latitudes, right_center_latitudes : sequence of float, optional
-        Per-swath equivalent of compute_swath_spectra()'s
-        `center_latitudes` -- each is passed only to its own swath's call,
-        so (unlike passing one shared list to both swaths) the segment
-        count for each swath matches the length of that swath's own list,
-        rather than being doubled across both.
-
     Returns
     -------
     dict with keys "left" and "right", each a PassSpectrumResult.
     """
     left_mask, right_mask = split_left_right_swaths(cross_track_distance)
-
-    center_latitudes_by_swath = {
-        "left": left_center_latitudes,
-        "right": right_center_latitudes,
-    }
 
     results = {}
     for name, mask in (("left", left_mask), ("right", right_mask)):
@@ -1008,6 +953,5 @@ def compute_pass_spectra(
             max_nan_fraction_2d=max_nan_fraction_2d,
             remove_plane_2d=remove_plane_2d,
             window_2d=window_2d,
-            center_latitudes=center_latitudes_by_swath[name],
         )
     return results

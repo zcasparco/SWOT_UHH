@@ -196,13 +196,8 @@ def process_one_file(
             lon_min=lon_min,
             lon_max=lon_max,
         )
-        # Build the returned per-swath `result` from the already
-        # lat/lon-filtered `all_segments`, not the raw (unfiltered)
-        # by_swath[swath].segments -- otherwise lat_min/lat_max/lon_min/
-        # lon_max only affect the optional pickled output and are
-        # silently ignored by the returned dict.
         result = {
-            swath: [s for s in all_segments if s.swath == swath]
+            swath: by_swath[swath].segments
             for swath in ("left", "right")
         }
         result_full = {
@@ -244,10 +239,8 @@ def process_one_file(
             lon_min=lon_min,
             lon_max=lon_max,
         )
-        # See comment in the full_direct branch above: build `result` from
-        # the filtered all_segments, not the raw by_swath[swath].segments.
         result = {
-            swath: [s for s in all_segments if s.swath == swath]
+            swath: by_swath[swath].segments
             for swath in ("left", "right")
         }
 
