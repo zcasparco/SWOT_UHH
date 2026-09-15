@@ -161,6 +161,7 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=Fal
         ssha = (ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret']).values
         #ssha = (ds[ssh_var] + ds['height_cor_xover']+ ds['internal_tide_hret']).values#.copy()
     else:
+        #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] - ds['internal_tide_hret'], dtype='float64')
         ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'], dtype='float64')
         #ssha = (ds[ssh_var] + ds['height_cor_xover']).values#.copy()
     #ssha = ssha.astype('float64')   # string dtype, no builtins involved
@@ -184,6 +185,18 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=Fal
         swh = np.where(np.array(ds['swh_karin_qual'])==0, np.array(ds['swh_karin']), np.nan)
         ssha = np.where(swh<=5,ssha,np.nan)
         
+    ds.close()
+    return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
+                'cross_track_distance': xtrack}
+
+def load_swot_l3_expert(filepath, ssh_var='ssha_filtered'):
+    # NO type annotations — avoids Python 3.14 PEP 649 __annotate__ capture bug
+    ds = xr.open_dataset(filepath)
+    ssha   = np.array(ds[ssh_var], dtype='float64')
+    lat = ds['latitude'].values
+    lon = ds['longitude'].values
+    xtrack = ds['cross_track_distance'].values
+    
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
                 'cross_track_distance': xtrack}
