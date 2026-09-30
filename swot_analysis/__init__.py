@@ -27,6 +27,7 @@ from .swot_alongtrack_spectra import (
     load_swot_l2,
     load_swot_l2_expert,
     load_swot_l2_unsmoothed,
+    load_swot_l3_expert,
     along_track_distance_km,
     split_left_right_swaths,
     compute_swath_spectra,
