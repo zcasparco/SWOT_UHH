@@ -95,13 +95,13 @@ except ImportError:
 # Default configuration (same defaults as swot_alias_wrapper.py)
 # =============================================================================
 
-SEGMENT_LENGTH_KM = 250.0
-OVERLAP = 0.0
+SEGMENT_LENGTH_KM = 1000.0
+OVERLAP = 0.5
 
 MAX_NAN_FRACTION = 0.15
 MAX_GAP_FRACTION = 0.1
 
-N_TAPS = 9
+N_TAPS = 17
 DETREND = "plane"   # "plane" | "linear" | "constant" | None
 REMOVE_EDGES_KM = None
 
@@ -111,6 +111,20 @@ DX1_EXPERT_KM = 2.0
 DX2_EXPERT_KM = 2.0
 
 SWATHS = ("left", "right")
+
+# --- QC defaults (new) -------------------------------------------------------
+# Row-level plausibility screening applied to BOTH products before segmenting.
+QC_MASK_BAD_ROWS = True
+QC_MAX_ABS_DEV_M = None        # None -> auto: max(5 m, 8 * robust sigma of row medians)
+QC_MAX_STEP_M = 5.0            # max jump of the cross-track row median between 2 lines
+QC_MAX_PIXEL_DEV_M = 10.0      # max |pixel - row median| (spikes)
+QC_DILATE_KM = 10.0            # grow the masked rows by this distance each side
+
+# Per-pair flags.
+QC_MAX_HF_RATIO = 20.0         # predicted / expert PSD in the high-k band
+QC_HF_BAND_MIN_K = 0.1         # cycles/km
+QC_MAX_LENGTH_ERROR = 0.03     # |track length - expected| / expected
+QC_MAX_STEP_FACTOR = 3.0       # max along-track step / nominal dx
 
 
 # =============================================================================
@@ -172,6 +186,25 @@ class MatchedSegmentPair:
     expert_gap_fraction: float
     unsmoothed_n_pixels: int
     expert_n_pixels: int
+
+    # QC flags (new). ``qc_ok`` is False if ANY check fails; ``qc_reasons`` is a
+    # comma-separated list of the failed checks (empty string when ok):
+    #   hf_ratio_high  predicted high-k PSD >> measured Expert high-k PSD
+    #                  (the "flat predicted / aliased spectrum" symptom)
+    #   hf_ratio_nan   high-k ratio could not be computed
+    #   grid_length    along-track length of a segment != expected from dx
+    #   grid_step      a gap / skipped lines in the along-track grid
+    qc_ok: bool = True
+    qc_reasons: str = ""
+    hf_ratio: float = float("nan")
+    unsmoothed_track_length_km: float = float("nan")
+    expert_track_length_km: float = float("nan")
+    unsmoothed_max_step_km: float = float("nan")
+    expert_max_step_km: float = float("nan")
+    unsmoothed_length_error: float = float("nan")
+    expert_length_error: float = float("nan")
+    unsmoothed_dx_actual_km: float = float("nan")
+    expert_dx_actual_km: float = float("nan")
 
 
 # =============================================================================
@@ -390,6 +423,122 @@ def _segment_center(lat_ref, lon_ref, i0, i1):
     return float(lat), float(lon)
 
 
+def _nanmedian_axis1(a):
+    """Row-wise nanmedian without the all-NaN RuntimeWarning (-> NaN)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(a, axis=1)
+
+
+def mask_implausible_rows(
+    data,
+    dx_km,
+    *,
+    max_abs_dev_m=QC_MAX_ABS_DEV_M,
+    max_step_m=QC_MAX_STEP_M,
+    max_pixel_dev_m=QC_MAX_PIXEL_DEV_M,
+    dilate_km=QC_DILATE_KM,
+):
+    """
+    Set to NaN rows (and spikes) whose SSH(A) values are not physical.
+
+    Why: ``qual == 0`` / surface flags do NOT catch everything. Near coasts,
+    ice, and in some dropouts the Unsmoothed ``ssh_karin_2`` contains smooth
+    ramps and plateaus of hundreds-thousands of metres with quality 0. Such
+    rows contain no NaN, so they pass every NaN / gap screening, and the 250 m
+    -> 2 km alias decomposition then turns the step/ramp (and the tail of the
+    low-pass filter applied to it) into a big, flat (white-like) aliased and
+    predicted PSD, while the real 2 km Expert data (where those rows were
+    flagged) show a normal red spectrum.
+
+    Tests, all on the cross-track row median (robust against noisy pixels):
+      * |row_median - pass median| > ``max_abs_dev_m`` (auto if None)
+      * |diff(row_median)| > ``max_step_m`` (ramps, jumps)
+      * per pixel |value - row_median| > ``max_pixel_dev_m`` (spikes)
+    Flagged rows are dilated by ``dilate_km`` on each side.
+
+    Returns ``(new_data, info)``; inputs are not modified.
+    """
+    ssha = np.array(data["ssha"], dtype=float, copy=True)
+    n_rows = ssha.shape[0]
+    rmed = _nanmedian_axis1(ssha)
+    fin = np.isfinite(rmed)
+    info = dict(n_rows=int(n_rows), n_rows_masked=0, n_pixels_spike=0,
+                max_abs_dev_m=None)
+    if fin.sum() < 3:
+        return dict(data, ssha=ssha), info
+
+    ref = float(np.median(rmed[fin]))
+    if max_abs_dev_m is None:
+        mad = float(np.median(np.abs(rmed[fin] - ref)))
+        max_abs_dev_m = max(5.0, 8.0 * 1.4826 * mad)
+    info["max_abs_dev_m"] = float(max_abs_dev_m)
+
+    bad = np.zeros(n_rows, dtype=bool)
+    bad[fin] |= np.abs(rmed[fin] - ref) > max_abs_dev_m
+
+    # step test on the valid rows only (so NaN rows do not hide a jump)
+    idx = np.where(fin)[0]
+    dstep = np.abs(np.diff(rmed[idx]))
+    jump = dstep > max_step_m
+    bad[idx[:-1][jump]] = True
+    bad[idx[1:][jump]] = True
+
+    nd = int(np.ceil(dilate_km / dx_km))
+    if nd > 0 and bad.any():
+        bad = np.convolve(bad.astype(float), np.ones(2 * nd + 1), mode="same") > 0
+
+    ssha[bad, :] = np.nan
+
+    with np.errstate(invalid="ignore"):
+        spike = np.abs(ssha - rmed[:, None]) > max_pixel_dev_m
+    info["n_pixels_spike"] = int(spike.sum())
+    ssha[spike] = np.nan
+
+    info["n_rows_masked"] = int(bad.sum())
+    return dict(data, ssha=ssha), info
+
+
+def _actual_dx_km(lat_ref, lon_ref):
+    """Median along-track step of a whole reference track (km)."""
+    st = np.atleast_1d(_haversine_km(lat_ref[:-1], lon_ref[:-1], lat_ref[1:], lon_ref[1:]))
+    st = st[np.isfinite(st) & (st > 0)]
+    return float(np.median(st)) if st.size else np.nan
+
+
+def _track_stats(lat_ref, lon_ref, i0, i1, dx_actual_km):
+    """
+    Along-track length of rows [i0, i1) on the reference track, its largest
+    single step, and the relative length error against ``(n-1) * dx_actual_km``.
+
+    ``dx_actual_km`` is the MEASURED median line spacing of the whole pass,
+    not the nominal one: the real spacing differs slightly from 0.25 / 2 km
+    (cross-track offset of the reference column, orbit geometry), and a check
+    against the nominal value flags every segment. Against the measured
+    spacing, only genuinely irregular stretches (missing / duplicated lines)
+    deviate. Returns ``(length_km, max_step_km, length_error_frac)``; NaN
+    entries mean "could not be evaluated" and are not treated as a failure.
+    """
+    la, lo = lat_ref[i0:i1], lon_ref[i0:i1]
+    if la.size < 2 or not np.isfinite(dx_actual_km) or not (
+        np.all(np.isfinite(la)) and np.all(np.isfinite(lo))
+    ):
+        return np.nan, np.nan, np.nan
+    steps = np.atleast_1d(_haversine_km(la[:-1], lo[:-1], la[1:], lo[1:]))
+    length = float(np.sum(steps))
+    expected = (la.size - 1) * dx_actual_km
+    return length, float(np.max(steps)), abs(length - expected) / expected
+
+
+def _hf_ratio(k, predicted, expert, k_min):
+    """Mean predicted / mean expert PSD for k >= k_min (NaN if undefined)."""
+    m = (k >= k_min) & np.isfinite(predicted) & np.isfinite(expert)
+    if m.sum() < 3:
+        return np.nan
+    e = float(np.mean(expert[m]))
+    return float(np.mean(predicted[m]) / e) if e > 0 else np.nan
+
+
 def expert_segment_psd(patch, dx1_expert_km, dx2_expert_km):
     """
     Measured Expert along-track PSD of one (already filled / detrended)
@@ -507,6 +656,16 @@ def compute_matched_spectra(
     max_center_offset_km: Optional[float] = None,
     harmonize: bool = True,
     max_column_nan_fraction: float = 0.5,
+    qc_mask_bad_rows: bool = QC_MASK_BAD_ROWS,
+    qc_max_abs_dev_m: Optional[float] = QC_MAX_ABS_DEV_M,
+    qc_max_step_m: float = QC_MAX_STEP_M,
+    qc_max_pixel_dev_m: float = QC_MAX_PIXEL_DEV_M,
+    qc_dilate_km: float = QC_DILATE_KM,
+    qc_max_hf_ratio: Optional[float] = QC_MAX_HF_RATIO,
+    qc_hf_band_min_k: float = QC_HF_BAND_MIN_K,
+    qc_max_length_error: Optional[float] = QC_MAX_LENGTH_ERROR,
+    qc_max_step_factor: Optional[float] = QC_MAX_STEP_FACTOR,
+    drop_flagged: bool = False,
     lat_min: Optional[float] = None,
     lat_max: Optional[float] = None,
     lon_min: Optional[float] = None,
@@ -535,6 +694,23 @@ def compute_matched_spectra(
         makes every Expert segment unfillable (-> empty output). See
         :func:`harmonize_columns`. ``max_column_nan_fraction`` is the NaN
         fraction above which a column counts as invalid.
+    qc_mask_bad_rows : bool
+        NaN-out non-physical rows/spikes in BOTH products before segmenting
+        (:func:`mask_implausible_rows`). This is the actual FIX for flat
+        predicted/aliased spectra caused by huge-valued rows that carry
+        ``qual == 0``. The masked rows then become gaps and the existing
+        ``max_gap_fraction`` / ``max_nan_fraction`` screening drops the
+        affected segments.
+    qc_max_hf_ratio, qc_hf_band_min_k : float
+        Flag (``qc_ok=False``) when mean predicted / mean measured PSD for
+        ``k >= qc_hf_band_min_k`` exceeds ``qc_max_hf_ratio``. Catches whatever
+        the row masking misses. ``None`` disables.
+    qc_max_length_error, qc_max_step_factor : float
+        Irregular-grid flags: relative error of a segment's along-track length
+        vs ``(n_rows-1)*dx``, and largest along-track step vs ``dx``.
+    drop_flagged : bool
+        If True, flagged pairs are removed (counted in ``n_dropped_qc``);
+        if False (default) they are kept with ``qc_ok=False`` / ``qc_reasons``.
     lat_min/lat_max/lon_min/lon_max : optional
         Geographic selection applied on the common ``lat_mean``/``lon_mean``
         (after pairing, so both products are always filtered identically).
@@ -551,6 +727,17 @@ def compute_matched_spectra(
         max_center_offset_km = 2.0 * dx1_expert_km
 
     detrend_func = make_detrend_func(detrend)
+
+    qc_info = None
+    if qc_mask_bad_rows:
+        kw = dict(max_abs_dev_m=qc_max_abs_dev_m, max_step_m=qc_max_step_m,
+                  max_pixel_dev_m=qc_max_pixel_dev_m, dilate_km=qc_dilate_km)
+        data_unsmoothed, qc_u = mask_implausible_rows(data_unsmoothed, dx1_native_km, **kw)
+        data_expert, qc_e = mask_implausible_rows(data_expert, dx1_expert_km, **kw)
+        qc_info = dict(unsmoothed=qc_u, expert=qc_e)
+        if verbose:
+            print(f"row QC: Unsmoothed {qc_u['n_rows_masked']}/{qc_u['n_rows']} rows, "
+                  f"Expert {qc_e['n_rows_masked']}/{qc_e['n_rows']} rows masked")
 
     column_info = None
     if harmonize:
@@ -620,7 +807,11 @@ def compute_matched_spectra(
             n_dropped_expert_failed=0,
             n_dropped_k_mismatch=0,
             n_dropped_geo_filter=0,
+            n_flagged_qc=0,
+            n_dropped_qc=0,
         )
+        if qc_info is not None:
+            cnt["row_qc"] = qc_info
         if column_info is not None:
             cnt["columns"] = column_info[swath]
         counts[swath] = cnt
@@ -642,6 +833,13 @@ def compute_matched_spectra(
             data_unsmoothed["latitude"], data_unsmoothed["longitude"], ref_u)
         lat_ref_e, lon_ref_e = _reference_track(
             data_expert["latitude"], data_expert["longitude"], ref_e)
+
+        dx_act_u = _actual_dx_km(lat_ref_u, lon_ref_u)
+        dx_act_e = _actual_dx_km(lat_ref_e, lon_ref_e)
+        cnt["dx_actual_km"] = dict(unsmoothed=dx_act_u, expert=dx_act_e)
+        if verbose:
+            print(f"{swath:5s}: measured line spacing  Unsmoothed {dx_act_u:.4f} km "
+                  f"(nominal {dx1_native_km}), Expert {dx_act_e:.4f} km (nominal {dx1_expert_km})")
 
         sub_lat_e = data_expert["latitude"][:, cols_e]
         sub_lon_e = data_expert["longitude"][:, cols_e]
@@ -688,6 +886,32 @@ def compute_matched_spectra(
                 cnt["n_dropped_geo_filter"] += 1
                 continue
 
+            # ---- 5. QC flags (flat-spectrum symptom + irregular grid) -----
+            reasons = []
+            ratio = _hf_ratio(seg.wavenumber, seg.total_psd, psd_e, qc_hf_band_min_k)
+            if qc_max_hf_ratio is not None:
+                if not np.isfinite(ratio):
+                    reasons.append("hf_ratio_nan")
+                elif ratio > qc_max_hf_ratio:
+                    reasons.append("hf_ratio_high")
+            len_u, step_u, err_u = _track_stats(lat_ref_u, lon_ref_u, i0, i1, dx_act_u)
+            len_e, step_e, err_e = _track_stats(lat_ref_e, lon_ref_e, j0, j1, dx_act_e)
+            # NaN (not evaluable) is never a failure: use "not (x > tol)".
+            if qc_max_length_error is not None and (
+                err_u > qc_max_length_error or err_e > qc_max_length_error
+            ):
+                reasons.append("grid_length")
+            if qc_max_step_factor is not None and (
+                step_u > qc_max_step_factor * dx_act_u
+                or step_e > qc_max_step_factor * dx_act_e
+            ):
+                reasons.append("grid_step")
+            if reasons:
+                cnt["n_flagged_qc"] += 1
+                if drop_flagged:
+                    cnt["n_dropped_qc"] += 1
+                    continue
+
             result[swath].append(
                 MatchedSegmentPair(
                     swath=swath,
@@ -718,6 +942,17 @@ def compute_matched_spectra(
                     expert_gap_fraction=info["gap_fraction"],
                     unsmoothed_n_pixels=seg.n_pixels,
                     expert_n_pixels=filled.shape[1],
+                    qc_ok=not reasons,
+                    qc_reasons=",".join(reasons),
+                    hf_ratio=ratio,
+                    unsmoothed_track_length_km=len_u,
+                    expert_track_length_km=len_e,
+                    unsmoothed_max_step_km=step_u,
+                    expert_max_step_km=step_e,
+                    unsmoothed_length_error=err_u,
+                    expert_length_error=err_e,
+                    unsmoothed_dx_actual_km=dx_act_u,
+                    expert_dx_actual_km=dx_act_e,
                 )
             )
             cnt["n_pairs"] += 1
@@ -737,7 +972,8 @@ def compute_matched_spectra(
                 f"gap={c['n_dropped_expert_gap']}, "
                 f"fill={c['n_dropped_expert_fill_failed']}, "
                 f"failed={c['n_dropped_expert_failed']}, "
-                f"k={c['n_dropped_k_mismatch']}, geo={c['n_dropped_geo_filter']}"
+                f"k={c['n_dropped_k_mismatch']}, geo={c['n_dropped_geo_filter']} | "
+                f"QC flagged={c['n_flagged_qc']} dropped={c['n_dropped_qc']}"
             )
             if "columns" in c:
                 print(f"       columns: {c['columns']}")
@@ -817,6 +1053,16 @@ def matched_pairs_to_dataset(pairs):
             expert_gap_filled=(["segment"], [bool(v) for v in col("expert_gap_filled")]),
             unsmoothed_n_pixels=(["segment"], col("unsmoothed_n_pixels")),
             expert_n_pixels=(["segment"], col("expert_n_pixels")),
+            qc_ok=(["segment"], [bool(v) for v in col("qc_ok")]),
+            qc_reasons=(["segment"], col("qc_reasons")),
+            hf_ratio=(["segment"], col("hf_ratio"), {
+                "long_name": "mean predicted / mean expert PSD for k >= QC_HF_BAND_MIN_K"}),
+            unsmoothed_track_length_km=(["segment"], col("unsmoothed_track_length_km"), {"units": "km"}),
+            expert_track_length_km=(["segment"], col("expert_track_length_km"), {"units": "km"}),
+            unsmoothed_max_step_km=(["segment"], col("unsmoothed_max_step_km"), {"units": "km"}),
+            expert_max_step_km=(["segment"], col("expert_max_step_km"), {"units": "km"}),
+            unsmoothed_length_error=(["segment"], col("unsmoothed_length_error")),
+            expert_length_error=(["segment"], col("expert_length_error")),
             swath=(["segment"], col("swath")),
             segment_index=(["segment"], col("segment_index")),
         ),

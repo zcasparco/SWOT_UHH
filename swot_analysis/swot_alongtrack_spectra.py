@@ -156,13 +156,17 @@ def load_swot_l2(filepath: str, ssh_var: str = "ssha_karin_2", hret: bool = True
 def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=False):
     # NO type annotations — avoids Python 3.14 PEP 649 __annotate__ capture bug
     ds = xr.open_dataset(filepath)
+    #if ssh_var in ['ssha_karin','ssha_karin_2']:
+    #    base = ds[ssh_var].where(np.abs(ds[ssh_var])<3)
+    if True:
+        base = ds[ssh_var]
     if HRET:
         #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret'], dtype='float64')
-        ssha = (ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret']).values
+        ssha = (base + ds['height_cor_xover'] + ds['internal_tide_hret']).values
         #ssha = (ds[ssh_var] + ds['height_cor_xover']+ ds['internal_tide_hret']).values#.copy()
     else:
         #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] - ds['internal_tide_hret'], dtype='float64')
-        ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'], dtype='float64')
+        ssha   = np.array(base + ds['height_cor_xover'], dtype='float64')
         #ssha = (ds[ssh_var] + ds['height_cor_xover']).values#.copy()
     #ssha = ssha.astype('float64')   # string dtype, no builtins involved
 

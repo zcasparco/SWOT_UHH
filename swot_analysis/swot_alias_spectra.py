@@ -1513,13 +1513,19 @@ def load_swot_l2_unsmoothed(
         # rather than any real land/rain/instrument dropout) that this
         # fix addresses. A per-pixel flag is kept so downstream code can
         # still identify/exclude uncorrected pixels if desired.
-        base = ds[ssh_var].values.astype(float)
+        #if ssh_var in ['ssha_karin','ssha_karin_2']:
+        #    base = ds[ssh_var].where(np.abs(ds[ssh_var])<3).values.astype(float)
+        if True:
+            base = ds[ssh_var].values.astype(float)
+
+            
 
         xover = ds["height_cor_xover"].values.astype(float)
         xover_missing = ~np.isfinite(xover)
         xover = np.where(xover_missing, 0.0, xover)
 
         ssha = base + xover
+        
         tide_missing = np.zeros_like(base, dtype=bool)
 
         if HRET:
