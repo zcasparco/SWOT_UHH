@@ -161,34 +161,28 @@ def load_swot_l2_expert(filepath, ssh_var='ssha_karin_2', HRET=True, swh_var=Fal
     if True:
         base = ds[ssh_var]
     if HRET:
-        #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] + ds['internal_tide_hret'], dtype='float64')
-        ssha = (base + ds['height_cor_xover'] + ds['internal_tide_hret']).values
-        #ssha = (ds[ssh_var] + ds['height_cor_xover']+ ds['internal_tide_hret']).values#.copy()
+        ssha = (base + ds['height_cor_xover'] + ds['internal_tide_hret']) #.values
     else:
-        #ssha   = np.array(ds[ssh_var] + ds['height_cor_xover'] - ds['internal_tide_hret'], dtype='float64')
-        ssha   = np.array(base + ds['height_cor_xover'], dtype='float64')
-        #ssha = (ds[ssh_var] + ds['height_cor_xover']).values#.copy()
-    #ssha = ssha.astype('float64')   # string dtype, no builtins involved
+        ssha   = (base + ds['height_cor_xover']) #.values
 
     for qual_name in (f'{ssh_var}_qual', 'ssha_karin_2_qual', 'ssh_karin_2_qual'):
         if qual_name in ds.variables:
-            ssha = np.where(np.array(ds[qual_name]) == 0, ssha, np.nan)
+            ssha = ssha.where(ds[qual_name] == 0)
             #ssha = np.where(ds[qual_name].values == 0, ssha, np.nan)
             break
     for scf in ('ancillary_surface_classification_flag', 'surface_classification_flag'):
         if scf in ds.variables:
-            ssha = np.where(np.array(ds[scf]) == 0, ssha, np.nan)
+            ssha = ssha.where(ds[scf] == 0)
             break
     if 'surface_type' in ds.variables:
-        ssha = np.where(np.array(ds['surface_type']) == 0, ssha, np.nan)
+        ssha = ssha.where(ds['surface_type'] == 0)
+    if swh_var:
+        swh = ds.swh_karin.where(ds['swh_karin_qual']==0)
+        ssha = ssha.where(swh<=5)
     lat = ds['latitude'].values
     lon = ds['longitude'].values
     xtrack = ds['cross_track_distance'].values
-    
-    if swh_var:
-        swh = np.where(np.array(ds['swh_karin_qual'])==0, np.array(ds['swh_karin']), np.nan)
-        ssha = np.where(swh<=5,ssha,np.nan)
-        
+    ssha = ssha.values
     ds.close()
     return {'ssha': ssha, 'latitude': lat, 'longitude': lon,
                 'cross_track_distance': xtrack}
