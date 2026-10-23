@@ -121,7 +121,7 @@ QC_MAX_PIXEL_DEV_M = 10.0      # max |pixel - row median| (spikes)
 QC_DILATE_KM = 10.0            # grow the masked rows by this distance each side
 
 # Per-pair flags.
-QC_MAX_HF_RATIO = 1.35         # predicted / expert PSD in the high-k band
+QC_MAX_HF_RATIO = 2.         # predicted / expert PSD in the high-k band
 QC_HF_BAND_MIN_K = 1/5         # cycles/km
 QC_MAX_LENGTH_ERROR = 0.03     # |track length - expected| / expected
 QC_MAX_STEP_FACTOR = 3.0       # max along-track step / nominal dx
