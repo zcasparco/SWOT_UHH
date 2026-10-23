@@ -843,7 +843,12 @@ def alias_decompose_patch(
 
     
     # r=0, s=0 = direct contribution.
-    direct_2d = S_filtered[:n1e, :n2e]
+    k2 = np.fft.fftfreq(n2, dx2_native_km)
+    kN_c = 0.5 / dx2_expert_km
+    cross = (k2 >= -kN_c) & (k2 < kN_c)        # |k_c| within the Expert Nyquist, both signs
+
+    direct_2d = S_filtered[:n1e, :][:, cross]  # along-track: same rows as before
+    #direct_2d = S_filtered[:n1e, :n2e]
     
     # ---------------------------------------------------------------
     # Integrate cross-track wavenumber.
